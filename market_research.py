@@ -24,32 +24,108 @@ from config import (
 # ─── Universe loaders ────────────────────────────────────────────────────────
 
 def get_sp500_tickers() -> list[str]:
-    """Scrape current S&P 500 constituents from Wikipedia."""
+    """Fetch S&P 500 tickers — tries multiple sources, falls back to hardcoded list."""
+
+    # Source 1: pull constituents directly from the SPY ETF holdings via yfinance
     try:
-        tables = pd.read_html(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        spy = yf.Ticker("SPY")
+        if hasattr(spy, "constituents") and spy.constituents is not None:
+            tickers = list(spy.constituents.index)
+            if len(tickers) > 400:
+                print(f"  [universe] Loaded {len(tickers)} tickers from SPY constituents.")
+                return [t.replace(".", "-") for t in tickers]
+    except Exception:
+        pass
+
+    # Source 2: Wikipedia with a browser-like User-Agent header
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        }
+        resp = requests.get(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            headers=headers, timeout=10
         )
-        return tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
+        resp.raise_for_status()
+        tables = pd.read_html(resp.text)
+        tickers = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
+        if len(tickers) > 400:
+            print(f"  [universe] Loaded {len(tickers)} tickers from Wikipedia.")
+            return tickers
     except Exception as e:
-        print(f"[warn] S&P 500 scrape failed: {e}. Using fallback list.")
-        return [
-            "AAPL","MSFT","GOOGL","AMZN","NVDA","META","BRK-B","UNH",
-            "LLY","JPM","V","XOM","MA","JNJ","PG","HD","MRK","ABBV",
-            "AVGO","CVX","COST","CRM","MCD","AMD","ACN","PEP","ADBE",
-            "TMO","CSCO","WMT","DIS","INTC","NFLX","IBM","GS","CAT","BA",
-        ]
+        print(f"  [universe] Wikipedia fetch failed: {e}")
+
+    # Source 3: hardcoded comprehensive list (top ~150 S&P 500 by market cap)
+    print("  [universe] Using built-in ticker list.")
+    return [
+        # Mega-cap tech
+        "AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","TSLA","AVGO","ORCL",
+        # Financials
+        "BRK-B","JPM","V","MA","BAC","WFC","GS","MS","AXP","BLK","SPGI","CB",
+        # Healthcare
+        "UNH","LLY","JNJ","ABBV","MRK","TMO","ABT","DHR","BMY","AMGN","ISRG",
+        # Consumer
+        "WMT","COST","PG","HD","MCD","KO","PEP","SBUX","NKE","TGT","LOW","TJX",
+        # Industrials
+        "CAT","BA","GE","HON","UPS","RTX","LMT","DE","MMM","ETN","ADP",
+        # Energy
+        "XOM","CVX","COP","SLB","EOG","MPC","PSX","VLO","OXY",
+        # Communication
+        "NFLX","DIS","CMCSA","T","VZ","CHTR","TMUS","PARA",
+        # Technology (non-mega)
+        "AMD","INTC","QCOM","TXN","MU","AMAT","LRCX","KLAC","MRVL","ADI",
+        "CRM","ADBE","NOW","INTU","PANW","SNPS","CDNS","FTNT","ANSS",
+        # Other large-cap tech
+        "ACN","IBM","CSCO","FICO","CTSH","IT","GLW",
+        # Healthcare devices / biotech
+        "SYK","BSX","MDT","EW","ZBH","BAX","DXCM","IDXX","A","IQV",
+        # REITs / Utilities
+        "NEE","DUK","SO","AEP","EXC","XEL","PCG","AMT","PLD","EQIX","CCI",
+        # Materials
+        "LIN","APD","SHW","ECL","NEM","FCX","NUE","VMC","MLM",
+    ]
 
 
 def get_nasdaq100_tickers() -> list[str]:
-    """Scrape Nasdaq-100 tickers."""
+    """Fetch Nasdaq-100 tickers via multiple sources."""
+
+    # Source 1: QQQ constituents via yfinance
     try:
-        tables = pd.read_html(
-            "https://en.wikipedia.org/wiki/Nasdaq-100"
-        )
-        df = tables[4] if len(tables) > 4 else tables[3]
-        return df["Ticker"].tolist()
+        qqq = yf.Ticker("QQQ")
+        if hasattr(qqq, "constituents") and qqq.constituents is not None:
+            tickers = list(qqq.constituents.index)
+            if len(tickers) > 80:
+                return [t.replace(".", "-") for t in tickers]
     except Exception:
-        return []
+        pass
+
+    # Source 2: Wikipedia with browser header
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        }
+        resp = requests.get(
+            "https://en.wikipedia.org/wiki/Nasdaq-100",
+            headers=headers, timeout=10
+        )
+        resp.raise_for_status()
+        tables = pd.read_html(resp.text)
+        for table in tables:
+            for col in ["Ticker", "Symbol", "ticker", "symbol"]:
+                if col in table.columns and len(table) > 80:
+                    return table[col].str.replace(".", "-", regex=False).tolist()
+    except Exception:
+        pass
+
+    return []
 
 
 def get_full_universe() -> list[str]:
@@ -77,7 +153,7 @@ def rank_sectors(lookback_days: int = 20) -> pd.DataFrame:
         if len(prices) < lookback_days:
             continue
         momentum = prices.iloc[-1] / prices.iloc[-lookback_days] - 1
-        rows.append({"sector": sector, "etf": etf, "momentum": momentum})
+        rows.append({"sector": sector, "etf": etf, "momentum": float(momentum)})
 
     df = pd.DataFrame(rows).sort_values("momentum", ascending=False)
     df["rank"] = range(1, len(df) + 1)
@@ -132,7 +208,7 @@ def score_fundamentals(ticker: str) -> dict:
         v_scores = []
         pe = result["pe_ratio"]
         if pe and MIN_PE_RATIO < pe < MAX_PE_RATIO:
-            v_scores.append(1 - pe / MAX_PE_RATIO)   # lower P/E = higher score
+            v_scores.append(1 - pe / MAX_PE_RATIO)
         pb = result["pb_ratio"]
         if pb and 0 < pb < MAX_PB_RATIO:
             v_scores.append(1 - pb / MAX_PB_RATIO)
@@ -142,7 +218,7 @@ def score_fundamentals(ticker: str) -> dict:
         q_scores = []
         roe = result["roe"]
         if roe and roe > 0:
-            q_scores.append(min(roe / 0.30, 1.0))    # cap at 30% ROE = 1.0
+            q_scores.append(min(roe / 0.30, 1.0))
         de = result["debt_equity"]
         if de is not None and de >= 0:
             q_scores.append(max(0, 1 - de / MAX_DEBT_EQUITY))
@@ -162,8 +238,6 @@ def score_fundamentals(ticker: str) -> dict:
         hi, lo = result["52w_high"], result["52w_low"]
         if hi and lo and hi != lo and result["price"]:
             pct_range = (result["price"] - lo) / (hi - lo)
-            # Sweet-spot: not too high (overbought) not too low (broken)
-            # Prefer ~30-60% of range
             result["momentum_score"] = float(1 - abs(pct_range - 0.45) / 0.55)
         else:
             result["momentum_score"] = 0.3
@@ -179,7 +253,7 @@ def score_fundamentals(ticker: str) -> dict:
         upside_score = 0.0
         if result["analyst_target"] and result["price"]:
             upside = (result["analyst_target"] - result["price"]) / result["price"]
-            upside_score = min(max(upside / 0.30, 0), 0.2)   # max 20% bonus
+            upside_score = min(max(upside / 0.30, 0), 0.2)
 
         # ── Composite ────────────────────────────────────────────────────────
         result["composite_score"] = (
@@ -213,7 +287,6 @@ def run_market_research(
 ) -> pd.DataFrame:
     """
     Full market research pipeline.
-
     Returns a ranked DataFrame of candidate stocks, best first.
     """
     if verbose:
@@ -233,14 +306,13 @@ def run_market_research(
     if verbose:
         print(f"\nUniverse size: {len(universe)} tickers")
 
-    # 3. Score candidates — throttle API calls
+    # 3. Score candidates
     results = []
     checked = 0
     for ticker in universe:
         scored = score_fundamentals(ticker)
         if not scored.get("passes_filter", False):
             continue
-        # Sector alignment bonus
         if scored.get("sector") in top_sectors:
             scored["composite_score"] = min(
                 scored["composite_score"] + 0.05, 1.0
@@ -252,11 +324,11 @@ def run_market_research(
         results.append(scored)
         checked += 1
         if verbose and checked % 20 == 0:
-            print(f"  Scored {checked} candidates…")
-        time.sleep(0.05)   # gentle throttle on yfinance
+            print(f"  Scored {checked} candidates...")
+        time.sleep(0.05)
 
         if len(results) >= max_candidates * 3:
-            break   # large enough pool to pick from
+            break
 
     if not results:
         print("[warn] No candidates passed filters.")
@@ -269,6 +341,7 @@ def run_market_research(
         print(f"\nTop 15 candidates:")
         cols = ["ticker","name","sector","composite_score",
                 "value_score","quality_score","growth_score"]
-        print(df[cols].head(15).to_string(index=False))
+        available = [c for c in cols if c in df.columns]
+        print(df[available].head(15).to_string(index=False))
 
     return df

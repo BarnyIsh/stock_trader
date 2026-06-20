@@ -61,3 +61,4 @@ models/
 api_keys/
 *.key
 *.pem
+.vercel

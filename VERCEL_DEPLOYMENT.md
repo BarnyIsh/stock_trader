@@ -85,13 +85,17 @@ credentials are required. X is scraped with Playwright from search pages, so no
 X API key is required. X may
 redirect anonymous headless browsers to login; if that happens, set the
 optional `X_AUTH_TOKEN` and `X_CT0` cookie values from a browser session.
-Playwright needs a browser binary such as Chromium. The regular Vercel Python
-function bundle is too small to ship Chromium with this project, so
-`vercel.json` sets `PLAYWRIGHT_BROWSERS_PATH=/tmp/playwright-browsers`. By
-default, the email will report X as unavailable if Chromium is missing. To try
-runtime browser installation, set `X_RUNTIME_BROWSER_INSTALL=true`; if that
-also fails on Vercel, deploy with Vercel's functions beta/extended function
-limits or move the X scrape to a separate job with a larger runtime.
+Playwright needs a browser binary such as Chromium. This project uses Vercel's
+extended function limits beta, enabled by deploying with:
+
+```text
+vercel@54.13.0 deploy --functions-beta --prod
+```
+
+`vercel.json` installs the Playwright Chromium headless shell during the build
+and sets `PLAYWRIGHT_BROWSERS_PATH=playwright-browsers`, keeping the browser
+available to the X scraper at runtime. Without extended function limits, this
+bundle is too large for the standard 500 MB Python function limit.
 Facebook/Meta public post search is not included by default because useful
 public content access requires approved Meta Graph API permissions.
 

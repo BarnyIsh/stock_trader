@@ -32,6 +32,14 @@ REDDIT_USER_AGENT = os.getenv(
 )
 REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID", "").strip()
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
+REDDIT_LISTINGS = [
+    item.strip()
+    for item in os.getenv("REDDIT_LISTINGS", "new,hot,rising,top").split(",")
+    if item.strip()
+]
+REDDIT_TOP_TIME_FILTER = os.getenv("REDDIT_TOP_TIME_FILTER", "day")
+X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
+X_TOP_N = int(os.getenv("X_TOP_N", "12"))
 SENTIMENT_MAX_ADJUST = float(os.getenv("SENTIMENT_MAX_ADJUST", "0.12"))
 NEWS_TOP_N = int(os.getenv("NEWS_TOP_N", "12"))
 REQUEST_TIMEOUT = float(os.getenv("SENTIMENT_REQUEST_TIMEOUT", "6"))
@@ -66,6 +74,8 @@ SOURCE_WEIGHTS = {
     "benzinga": 0.85,
     "motley fool": 0.65,
     "reddit": 0.55,
+    "x": 0.70,
+    "twitter": 0.70,
 }
 
 
@@ -76,6 +86,10 @@ class MentionStats:
     reddit_comments: int = 0
     reddit_score: int = 0
     reddit_sentiment: float = 0.0
+    x_mentions: int = 0
+    x_likes: int = 0
+    x_retweets: int = 0
+    x_sentiment: float = 0.0
     news_mentions: int = 0
     news_sentiment: float = 0.0
     weighted_news_sentiment: float = 0.0
@@ -107,8 +121,47 @@ def _ticker_pattern(tickers: list[str]) -> re.Pattern:
     return re.compile(r"(?<![A-Z$])\$?(" + "|".join(escaped) + r")(?![A-Z])")
 
 
+def _dedupe_posts(posts: list[dict]) -> list[dict]:
+    seen = set()
+    rows = []
+    for post in posts:
+        key = post.get("id") or post.get("permalink") or post.get("title")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        rows.append(post)
+    return rows
+
+
+def _fetch_reddit_listing(
+    base_url: str,
+    listing: str,
+    headers: dict,
+    params: dict | None = None,
+) -> list[dict]:
+    if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
+        url = f"{base_url}/{listing}"
+    else:
+        url = f"{base_url}/{listing}.json"
+
+    try:
+        resp = requests.get(
+            url,
+            params=params or {"limit": 75},
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        children = resp.json().get("data", {}).get("children", [])
+        return [child.get("data", {}) for child in children]
+    except Exception as exc:
+        print(f"[sentiment] Reddit {listing} fetch failed: {exc}")
+        return []
+
+
 def _fetch_reddit_posts() -> list[dict]:
     headers = {"User-Agent": REDDIT_USER_AGENT}
+    posts = []
     if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
         try:
             token_resp = requests.post(
@@ -124,36 +177,53 @@ def _fetch_reddit_posts() -> list[dict]:
                 "User-Agent": REDDIT_USER_AGENT,
                 "Authorization": f"Bearer {token}",
             }
-            resp = requests.get(
-                f"https://oauth.reddit.com/r/{REDDIT_SUBREDDITS}/new",
-                params={"limit": 100},
-                headers=api_headers,
-                timeout=REQUEST_TIMEOUT,
-            )
-            resp.raise_for_status()
-            children = resp.json().get("data", {}).get("children", [])
-            return [child.get("data", {}) for child in children]
+            base_url = f"https://oauth.reddit.com/r/{REDDIT_SUBREDDITS}"
+            for listing in REDDIT_LISTINGS:
+                params = {"limit": 75}
+                if listing == "top":
+                    params["t"] = REDDIT_TOP_TIME_FILTER
+                posts.extend(_fetch_reddit_listing(base_url, listing, api_headers, params))
+                time.sleep(0.05)
+            return _dedupe_posts(posts)
         except Exception as exc:
             print(f"[sentiment] Reddit OAuth fetch failed: {exc}")
             return []
 
-    url = f"https://www.reddit.com/r/{REDDIT_SUBREDDITS}/new.json"
+    print(
+        "[sentiment] Reddit OAuth credentials not set; attempting public "
+        "JSON listings, which Reddit may block."
+    )
+    base_url = f"https://www.reddit.com/r/{REDDIT_SUBREDDITS}"
+    for listing in REDDIT_LISTINGS:
+        params = {"limit": 75}
+        if listing == "top":
+            params["t"] = REDDIT_TOP_TIME_FILTER
+        posts.extend(_fetch_reddit_listing(base_url, listing, headers, params))
+        time.sleep(0.05)
+    return _dedupe_posts(posts)
+
+
+def _fetch_x_posts(tickers: list[str]) -> list[dict]:
+    if not X_BEARER_TOKEN:
+        return []
+    selected = tickers[:X_TOP_N]
+    cashtags = " OR ".join(f"${ticker}" for ticker in selected)
+    query = f"({cashtags}) (stock OR stocks OR earnings OR shares OR market) -is:retweet lang:en"
     try:
         resp = requests.get(
-            url,
-            params={"limit": 100},
-            headers=headers,
+            "https://api.x.com/2/tweets/search/recent",
+            params={
+                "query": query,
+                "max_results": 100,
+                "tweet.fields": "created_at,public_metrics,lang",
+            },
+            headers={"Authorization": f"Bearer {X_BEARER_TOKEN}"},
             timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
-        children = resp.json().get("data", {}).get("children", [])
-        return [child.get("data", {}) for child in children]
+        return resp.json().get("data", [])
     except Exception as exc:
-        print(
-            "[sentiment] Reddit fetch skipped/failed. "
-            "Set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET for OAuth access: "
-            f"{exc}"
-        )
+        print(f"[sentiment] X recent search failed: {exc}")
         return []
 
 
@@ -242,6 +312,45 @@ def build_sentiment_overlay(
             denom = item.reddit_mentions + math.log1p(max(item.reddit_comments, 0))
             item.reddit_sentiment = item.reddit_sentiment / max(denom, 1)
 
+    ranked_tickers = (
+        scored_df.sort_values("prob_buy", ascending=False)["ticker"]
+        .head(max(X_TOP_N, NEWS_TOP_N))
+        .tolist()
+    )
+    for post in _fetch_x_posts(ranked_tickers):
+        text = post.get("text", "")
+        mentioned = set(pattern.findall(text.upper()))
+        if not mentioned:
+            continue
+        metrics = post.get("public_metrics", {}) or {}
+        likes = int(metrics.get("like_count", 0) or 0)
+        retweets = int(metrics.get("retweet_count", 0) or 0)
+        replies = int(metrics.get("reply_count", 0) or 0)
+        sentiment = _sentiment_score(text)
+        attention = (
+            1
+            + math.log1p(max(likes, 0))
+            + math.log1p(max(retweets, 0))
+            + 0.5 * math.log1p(max(replies, 0))
+        )
+        for ticker in mentioned:
+            item = stats.get(ticker)
+            if item is None:
+                continue
+            item.x_mentions += 1
+            item.x_likes += likes
+            item.x_retweets += retweets
+            item.x_sentiment += sentiment * attention
+
+    for item in stats.values():
+        if item.x_mentions:
+            denom = (
+                item.x_mentions
+                + math.log1p(max(item.x_likes, 0))
+                + math.log1p(max(item.x_retweets, 0))
+            )
+            item.x_sentiment = item.x_sentiment / max(denom, 1)
+
     for news in _fetch_market_news_items():
         text = f"{news['title']} {news['description']}"
         mentioned = set(pattern.findall(text.upper()))
@@ -290,7 +399,11 @@ def build_sentiment_overlay(
             item.news_sentiment = weighted_sum / max(item.news_mentions, 1)
 
     mention_counts = [
-        s.reddit_mentions + s.news_mentions + math.log1p(max(s.reddit_comments, 0))
+        s.reddit_mentions
+        + s.x_mentions
+        + s.news_mentions
+        + math.log1p(max(s.reddit_comments, 0))
+        + math.log1p(max(s.x_likes + s.x_retweets, 0))
         for s in stats.values()
     ]
     mean_attention = sum(mention_counts) / max(len(mention_counts), 1)
@@ -299,13 +412,20 @@ def build_sentiment_overlay(
 
     base_probs = dict(zip(scored_df["ticker"], scored_df["prob_buy"]))
     for ticker, item in stats.items():
-        count = item.reddit_mentions + item.news_mentions + math.log1p(max(item.reddit_comments, 0))
+        count = (
+            item.reddit_mentions
+            + item.x_mentions
+            + item.news_mentions
+            + math.log1p(max(item.reddit_comments, 0))
+            + math.log1p(max(item.x_likes + item.x_retweets, 0))
+        )
         z_attention = max(0.0, min(2.0, (count - mean_attention) / std_attention))
         item.attention_score = z_attention / 2.0
 
         sentiment = (
             0.55 * item.weighted_news_sentiment
-            + 0.25 * item.reddit_sentiment
+            + 0.18 * item.reddit_sentiment
+            + 0.12 * item.x_sentiment
             + 0.20 * item.attention_score
         )
         item.sentiment_adjustment = max(
@@ -331,7 +451,8 @@ def apply_sentiment_overlay(scored_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.D
         overlay[[
             "ticker", "sentiment_adjustment", "adjusted_prob_buy",
             "reddit_mentions", "reddit_comments", "reddit_score",
-            "reddit_sentiment", "news_mentions", "weighted_news_sentiment",
+            "reddit_sentiment", "x_mentions", "x_likes", "x_retweets",
+            "x_sentiment", "news_mentions", "weighted_news_sentiment",
             "attention_score",
         ]],
         on="ticker",

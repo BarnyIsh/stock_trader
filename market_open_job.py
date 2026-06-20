@@ -154,7 +154,8 @@ def run_market_open_job(send_email: bool = True) -> dict:
 
     top_cols = [
         "ticker", "price", "base_prob_buy", "sentiment_adjustment", "prob_buy",
-        "reddit_mentions", "news_mentions", "attention_score", "rsi", "bb_pct",
+        "reddit_mentions", "x_mentions", "news_mentions", "attention_score",
+        "rsi", "bb_pct",
     ]
     top = scored_df.head(10)[[c for c in top_cols if c in scored_df.columns]]
     subject = f"Stock Trader intents for {now_ny:%Y-%m-%d}"

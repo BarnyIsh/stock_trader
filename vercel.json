@@ -9,11 +9,5 @@
       "path": "/api/market_open",
       "schedule": "30 14 * * 1-5"
     }
-  ],
-  "functions": {
-    "api/market_open.py": {
-      "maxDuration": 60,
-      "excludeFiles": "{logs/**,__pycache__/**,.venv/**,.git/**,*.zip}"
-    }
-  }
+  ]
 }

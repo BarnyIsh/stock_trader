@@ -70,7 +70,8 @@ NEWS_TOP_N=12
 REDDIT_SUBREDDITS=wallstreetbets+investing+stocks+news
 REDDIT_LISTINGS=hot,new,rising,top
 REDDIT_TOP_TIME_FILTER=day
-REDDIT_USER_AGENT=windows:stock-trader-market-open:v1.0 (by /u/BarnyIsh)
+REDDIT_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36
+REDDIT_COOKIE=<optional reddit browser Cookie header>
 X_TOP_N=12
 X_SEARCH_PAGES=2
 X_AUTH_TOKEN=<optional x auth_token cookie>
@@ -99,7 +100,9 @@ Vercel.
 Reddit is fetched from public JSON endpoints. These URLs may open in your
 browser but still return 403 from Vercel because Reddit blocks some server IPs.
 When a remote browser endpoint is configured, Reddit JSON fetches that are
-blocked from Vercel are retried through the same remote browser.
+blocked from Vercel are retried through the same remote browser. If Reddit still
+returns a login/block page, set `REDDIT_COOKIE` to the full `Cookie` request
+header copied from a logged-in browser request to `https://www.reddit.com/r/stocks.json`.
 Facebook/Meta public post search is not included by default because useful
 public content access requires approved Meta Graph API permissions.
 

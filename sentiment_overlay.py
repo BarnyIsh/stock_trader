@@ -30,8 +30,12 @@ REDDIT_SUBREDDITS = os.getenv(
 )
 REDDIT_USER_AGENT = os.getenv(
     "REDDIT_USER_AGENT",
-    "windows:stock-trader-market-open:v1.0 (by /u/BarnyIsh)",
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+    ),
 )
+REDDIT_COOKIE = os.getenv("REDDIT_COOKIE", "").strip()
 REDDIT_LISTINGS = [
     item.strip()
     for item in os.getenv("REDDIT_LISTINGS", "hot,new,rising,top").split(",")
@@ -173,11 +177,14 @@ def _reddit_subreddit_names() -> list[str]:
 
 
 def _reddit_headers() -> dict:
-    return {
+    headers = {
         "User-Agent": REDDIT_USER_AGENT,
         "Accept": "application/json,text/plain,*/*",
         "Accept-Language": "en-US,en;q=0.9",
     }
+    if REDDIT_COOKIE:
+        headers["Cookie"] = REDDIT_COOKIE
+    return headers
 
 
 def _fetch_reddit_listing(
@@ -240,6 +247,7 @@ def _fetch_reddit_listing_with_playwright(
                 viewport={"width": 1280, "height": 900},
                 user_agent=REDDIT_USER_AGENT,
             )
+            _add_cookie_header_cookies(context, REDDIT_COOKIE, ".reddit.com")
             page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=int(REQUEST_TIMEOUT * 1000))
             text = page.locator("body").inner_text(timeout=int(REQUEST_TIMEOUT * 1000)).strip()
@@ -321,15 +329,10 @@ def _fetch_x_posts(tickers: list[str]) -> list[dict]:
         print(f"[sentiment] X scrape skipped; Playwright import failed: {exc}")
         return []
 
-    query = " OR ".join(f"${ticker}" for ticker in selected)
-    search_url = (
-        "https://x.com/search?"
-        f"q={quote_plus(f'({query}) (stock OR stocks OR earnings OR shares OR market) lang:en')}"
-        "&src=typed_query&f=live"
-    )
+    search_urls = [_x_search_url(ticker) for ticker in selected]
 
     try:
-        return _scrape_x_with_playwright(sync_playwright, PlaywrightTimeoutError, search_url)
+        return _scrape_x_with_playwright(sync_playwright, PlaywrightTimeoutError, search_urls)
     except Exception as exc:
         if "Executable doesn't exist" not in str(exc):
             if _playwright_system_lib_missing(exc):
@@ -354,14 +357,19 @@ def _fetch_x_posts(tickers: list[str]) -> list[dict]:
         return []
 
     try:
-        return _scrape_x_with_playwright(sync_playwright, PlaywrightTimeoutError, search_url)
+        return _scrape_x_with_playwright(sync_playwright, PlaywrightTimeoutError, search_urls)
     except Exception as exc:
         _mark_source("x", f"unavailable: scrape failed after browser install: {exc}")
         print(f"[sentiment] X scrape failed after browser install: {exc}")
         return []
 
 
-def _scrape_x_with_playwright(sync_playwright, timeout_error, search_url: str) -> list[dict]:
+def _x_search_url(ticker: str) -> str:
+    query = f"${ticker} (stock OR stocks OR earnings OR shares OR market) lang:en"
+    return f"https://x.com/search?q={quote_plus(query)}&src=typed_query&f=live"
+
+
+def _scrape_x_with_playwright(sync_playwright, timeout_error, search_urls: list[str]) -> list[dict]:
     with sync_playwright() as p:
         browser = _open_playwright_browser(p)
         context = browser.new_context(
@@ -374,42 +382,52 @@ def _scrape_x_with_playwright(sync_playwright, timeout_error, search_url: str) -
         )
         _add_x_session_cookies(context)
         page = context.new_page()
-        page.goto(search_url, wait_until="domcontentloaded", timeout=int(REQUEST_TIMEOUT * 1000))
 
         posts: list[dict] = []
         seen: set[str] = set()
-        for _ in range(max(X_SEARCH_PAGES, 1)):
-            try:
-                page.wait_for_selector("article[data-testid='tweet']", timeout=3500)
-            except timeout_error:
-                break
+        login_required = False
+        empty_reason = ""
+        for search_url in search_urls:
+            page.goto(search_url, wait_until="domcontentloaded", timeout=int(REQUEST_TIMEOUT * 1000))
+            for _ in range(max(X_SEARCH_PAGES, 1)):
+                try:
+                    page.wait_for_selector("article[data-testid='tweet']", timeout=3500)
+                except timeout_error:
+                    empty_reason = _x_empty_reason(page)
+                    break
 
-            articles = page.locator("article[data-testid='tweet']").all()
-            for article in articles:
-                text = _x_article_text(article)
-                if not text:
-                    continue
-                key = re.sub(r"\s+", " ", text).strip()[:240]
-                if key in seen:
-                    continue
-                seen.add(key)
-                posts.append({
-                    "text": text,
-                    "public_metrics": _x_article_metrics(article),
-                })
+                articles = page.locator("article[data-testid='tweet']").all()
+                for article in articles:
+                    text = _x_article_text(article)
+                    if not text:
+                        continue
+                    key = re.sub(r"\s+", " ", text).strip()[:240]
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    posts.append({
+                        "text": text,
+                        "public_metrics": _x_article_metrics(article),
+                    })
+                    if len(posts) >= 100:
+                        break
                 if len(posts) >= 100:
                     break
+                page.mouse.wheel(0, 1600)
+                page.wait_for_timeout(900)
             if len(posts) >= 100:
                 break
-            page.mouse.wheel(0, 1600)
-            page.wait_for_timeout(900)
+            if _x_login_required(page):
+                login_required = True
+                break
 
-        login_required = _x_login_required(page)
         browser.close()
         if posts:
             _mark_source("x", f"ok: scraped {len(posts)} posts")
         elif login_required:
             _mark_source("x", "unavailable: login required; set X_AUTH_TOKEN and X_CT0")
+        elif empty_reason:
+            _mark_source("x", f"unavailable: no posts rendered ({empty_reason})")
         else:
             _mark_source("x", "ok: no public posts found")
         return posts
@@ -490,6 +508,31 @@ def _add_x_session_cookies(context) -> None:
     ])
 
 
+def _add_cookie_header_cookies(context, cookie_header: str, domain: str) -> None:
+    if not cookie_header:
+        return
+    cookies = []
+    for part in cookie_header.split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            continue
+        cookies.append({
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": "/",
+            "secure": True,
+            "httpOnly": False,
+            "sameSite": "Lax",
+        })
+    if cookies:
+        context.add_cookies(cookies)
+
+
 def _x_login_required(page) -> bool:
     try:
         if "/i/jf/onboarding/web" in page.url or "mode=login" in page.url:
@@ -498,6 +541,24 @@ def _x_login_required(page) -> bool:
         return "email or username" in text and "continue with" in text
     except Exception:
         return False
+
+
+def _x_empty_reason(page) -> str:
+    try:
+        text = page.locator("body").inner_text(timeout=1000)
+    except Exception:
+        return "empty page"
+    normalized = re.sub(r"\s+", " ", text).strip()
+    lower = normalized.lower()
+    if "something went wrong" in lower:
+        return "x error page"
+    if "try reloading" in lower:
+        return "x reload prompt"
+    if "no results" in lower:
+        return "x no results page"
+    if "email or username" in lower and "continue with" in lower:
+        return "login page"
+    return normalized[:180] or "empty page"
 
 
 def _x_article_text(article) -> str:

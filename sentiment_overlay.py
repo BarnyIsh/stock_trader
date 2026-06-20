@@ -18,7 +18,6 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
 from html import unescape
 from urllib.parse import quote_plus
-from requests.auth import HTTPBasicAuth
 
 import pandas as pd
 import requests
@@ -26,17 +25,15 @@ import requests
 
 REDDIT_SUBREDDITS = os.getenv(
     "REDDIT_SUBREDDITS",
-    "wallstreetbets+stocks+investing+StockMarket",
+    "wallstreetbets+investing+stocks+news",
 )
 REDDIT_USER_AGENT = os.getenv(
     "REDDIT_USER_AGENT",
     "windows:stock-trader-market-open:v1.0 (by /u/BarnyIsh)",
 )
-REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID", "").strip()
-REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
 REDDIT_LISTINGS = [
     item.strip()
-    for item in os.getenv("REDDIT_LISTINGS", "new,hot,rising,top").split(",")
+    for item in os.getenv("REDDIT_LISTINGS", "hot,new,rising,top").split(",")
     if item.strip()
 ]
 REDDIT_TOP_TIME_FILTER = os.getenv("REDDIT_TOP_TIME_FILTER", "day")
@@ -147,7 +144,10 @@ def _dedupe_posts(posts: list[dict]) -> list[dict]:
     seen = set()
     rows = []
     for post in posts:
-        key = post.get("id") or post.get("permalink") or post.get("title")
+        post_id = post.get("id", "")
+        key = f"{post.get('subreddit', '')}:{post_id}" if post_id else (
+            post.get("permalink") or post.get("title")
+        )
         if not key or key in seen:
             continue
         seen.add(key)
@@ -155,78 +155,80 @@ def _dedupe_posts(posts: list[dict]) -> list[dict]:
     return rows
 
 
+def _reddit_subreddit_names() -> list[str]:
+    raw = re.split(r"[,+\s]+", REDDIT_SUBREDDITS)
+    names = []
+    for item in raw:
+        name = item.strip().strip("/")
+        if not name:
+            continue
+        if name.lower().startswith("r/"):
+            name = name[2:]
+        names.append(name)
+    return list(dict.fromkeys(names))
+
+
+def _reddit_headers() -> dict:
+    return {
+        "User-Agent": REDDIT_USER_AGENT,
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+
 def _fetch_reddit_listing(
-    base_url: str,
+    subreddit: str,
     listing: str,
     headers: dict,
     params: dict | None = None,
 ) -> list[dict]:
-    if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
-        url = f"{base_url}/{listing}"
+    if listing == "hot":
+        url = f"https://www.reddit.com/r/{subreddit}.json"
     else:
-        url = f"{base_url}/{listing}.json"
+        url = f"https://www.reddit.com/r/{subreddit}/{listing}.json"
 
     try:
         resp = requests.get(
             url,
-            params=params or {"limit": 75},
+            params=params,
             headers=headers,
             timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
         children = resp.json().get("data", {}).get("children", [])
-        _mark_source("reddit", "ok")
-        return [child.get("data", {}) for child in children]
+        rows = []
+        for child in children:
+            post = child.get("data", {}) or {}
+            post.setdefault("subreddit", subreddit)
+            rows.append(post)
+        return rows
     except Exception as exc:
-        _mark_source("reddit", f"unavailable: {exc}")
-        print(f"[sentiment] Reddit {listing} fetch failed: {exc}")
+        print(f"[sentiment] Reddit r/{subreddit} {listing} fetch failed: {exc}")
         return []
 
 
 def _fetch_reddit_posts() -> list[dict]:
-    headers = {"User-Agent": REDDIT_USER_AGENT}
+    headers = _reddit_headers()
     posts = []
-    if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
-        try:
-            token_resp = requests.post(
-                "https://www.reddit.com/api/v1/access_token",
-                auth=HTTPBasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET),
-                data={"grant_type": "client_credentials"},
-                headers=headers,
-                timeout=REQUEST_TIMEOUT,
-            )
-            token_resp.raise_for_status()
-            token = token_resp.json()["access_token"]
-            api_headers = {
-                "User-Agent": REDDIT_USER_AGENT,
-                "Authorization": f"Bearer {token}",
-            }
-            base_url = f"https://oauth.reddit.com/r/{REDDIT_SUBREDDITS}"
-            for listing in REDDIT_LISTINGS:
-                params = {"limit": 75}
-                if listing == "top":
-                    params["t"] = REDDIT_TOP_TIME_FILTER
-                posts.extend(_fetch_reddit_listing(base_url, listing, api_headers, params))
-                time.sleep(0.05)
-            return _dedupe_posts(posts)
-        except Exception as exc:
-            _mark_source("reddit", f"oauth failed: {exc}")
-            print(f"[sentiment] Reddit OAuth fetch failed: {exc}")
-            return []
+    subreddits = _reddit_subreddit_names()
+    if not subreddits:
+        _mark_source("reddit", "not configured")
+        return []
 
-    _mark_source("reddit", "not configured; public JSON may be blocked")
-    print(
-        "[sentiment] Reddit OAuth credentials not set; attempting public "
-        "JSON listings, which Reddit may block."
-    )
-    base_url = f"https://www.reddit.com/r/{REDDIT_SUBREDDITS}"
-    for listing in REDDIT_LISTINGS:
-        params = {"limit": 75}
-        if listing == "top":
-            params["t"] = REDDIT_TOP_TIME_FILTER
-        posts.extend(_fetch_reddit_listing(base_url, listing, headers, params))
-        time.sleep(0.05)
-    return _dedupe_posts(posts)
+    for subreddit in subreddits:
+        for listing in REDDIT_LISTINGS:
+            params = None if listing == "hot" else {"limit": 75}
+            if listing == "top" and params is not None:
+                params["t"] = REDDIT_TOP_TIME_FILTER
+            posts.extend(_fetch_reddit_listing(subreddit, listing, headers, params))
+            time.sleep(0.05)
+
+    deduped = _dedupe_posts(posts)
+    if deduped:
+        _mark_source("reddit", f"ok: fetched {len(deduped)} posts")
+    else:
+        _mark_source("reddit", "unavailable: public JSON returned no posts")
+    return deduped
 
 
 def _fetch_x_posts(tickers: list[str]) -> list[dict]:

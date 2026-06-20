@@ -66,12 +66,10 @@ base model score. These are optional:
 ```text
 SENTIMENT_MAX_ADJUST=0.12
 NEWS_TOP_N=12
-REDDIT_SUBREDDITS=wallstreetbets+stocks+investing+StockMarket
-REDDIT_LISTINGS=new,hot,rising,top
+REDDIT_SUBREDDITS=wallstreetbets+investing+stocks+news
+REDDIT_LISTINGS=hot,new,rising,top
 REDDIT_TOP_TIME_FILTER=day
 REDDIT_USER_AGENT=windows:stock-trader-market-open:v1.0 (by /u/BarnyIsh)
-REDDIT_CLIENT_ID=<reddit app client id>
-REDDIT_CLIENT_SECRET=<reddit app client secret>
 X_TOP_N=12
 X_SEARCH_PAGES=2
 X_AUTH_TOKEN=<optional x auth_token cookie>
@@ -80,9 +78,10 @@ SENTIMENT_REQUEST_TIMEOUT=6
 ```
 
 `prob_buy` in the email is the adjusted score. `base_prob_buy` is the original
-ML score before the overlay. Reddit access works best with OAuth credentials;
-without them, the job tries public JSON listings but Reddit may block it. X is
-scraped with Playwright from search pages, so no X API key is required. X may
+ML score before the overlay. Reddit is fetched from public subreddit JSON
+endpoints such as `https://www.reddit.com/r/stocks.json`; no Reddit API
+credentials are required. X is scraped with Playwright from search pages, so no
+X API key is required. X may
 redirect anonymous headless browsers to login; if that happens, set the
 optional `X_AUTH_TOKEN` and `X_CT0` cookie values from a browser session.
 `vercel.json` installs the Playwright Chromium headless shell into the

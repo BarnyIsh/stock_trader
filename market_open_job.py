@@ -20,6 +20,7 @@ import pandas as pd
 from config import PAPER_TRADING
 from model import MODEL_DIR, score_today
 from portfolio import Portfolio, Position
+from sentiment_overlay import apply_sentiment_overlay
 from trader import get_atr_map, get_live_prices
 
 
@@ -111,9 +112,10 @@ def run_market_open_job(send_email: bool = True) -> dict:
     bundle = _load_model_bundle()
     tickers = bundle["metadata"]["tickers"]
 
-    scored_df = score_today(tickers, model_bundle=bundle)
-    if scored_df.empty:
+    base_scored_df = score_today(tickers, model_bundle=bundle)
+    if base_scored_df.empty:
         raise RuntimeError("Model scoring returned no rows.")
+    scored_df, overlay_df = apply_sentiment_overlay(base_scored_df)
 
     portfolio = _portfolio_from_env()
     current_tickers = list(dict.fromkeys(tickers + list(portfolio.positions.keys())))
@@ -150,7 +152,11 @@ def run_market_open_job(send_email: bool = True) -> dict:
             "prob_buy": float(score_map.get(ticker, 0.0)),
         })
 
-    top = scored_df.head(10)[["ticker", "price", "prob_buy", "rsi", "bb_pct"]]
+    top_cols = [
+        "ticker", "price", "base_prob_buy", "sentiment_adjustment", "prob_buy",
+        "reddit_mentions", "news_mentions", "attention_score", "rsi", "bb_pct",
+    ]
+    top = scored_df.head(10)[[c for c in top_cols if c in scored_df.columns]]
     subject = f"Stock Trader intents for {now_ny:%Y-%m-%d}"
     body = "\n".join([
         f"Market-open model intents for {now_ny:%Y-%m-%d %H:%M %Z}",
@@ -166,6 +172,9 @@ def run_market_open_job(send_email: bool = True) -> dict:
         "Top model scores:",
         top.to_string(index=False),
         "",
+        "prob_buy includes the capped news/Reddit attention overlay.",
+        "base_prob_buy is the original ML score before the overlay.",
+        "",
         "This email is an intent log only; it does not place orders.",
     ])
 
@@ -178,6 +187,7 @@ def run_market_open_job(send_email: bool = True) -> dict:
             "drawdown": decisions["drawdown"],
         },
         "top_scores": top.to_dict(orient="records"),
+        "sentiment_overlay": overlay_df.head(25).to_dict(orient="records"),
         "positions": {
             ticker: asdict(position)
             for ticker, position in portfolio.positions.items()

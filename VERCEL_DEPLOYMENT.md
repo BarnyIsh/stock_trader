@@ -58,6 +58,25 @@ CRON_SECRET=<random long secret>
 For Gmail, `SMTP_PASSWORD` should be an app password, not your normal account
 password.
 
+## Optional Sentiment Overlay Variables
+
+The market-open email applies a capped news/Reddit attention overlay to the
+base model score. These are optional:
+
+```text
+SENTIMENT_MAX_ADJUST=0.12
+NEWS_TOP_N=12
+REDDIT_SUBREDDITS=wallstreetbets+stocks+investing+StockMarket
+REDDIT_USER_AGENT=windows:stock-trader-market-open:v1.0 (by /u/BarnyIsh)
+REDDIT_CLIENT_ID=<reddit app client id>
+REDDIT_CLIENT_SECRET=<reddit app client secret>
+SENTIMENT_REQUEST_TIMEOUT=6
+```
+
+`prob_buy` in the email is the adjusted score. `base_prob_buy` is the original
+ML score before the overlay. Reddit access works best with OAuth credentials;
+without them, the job skips Reddit and still uses news RSS.
+
 ## Optional Portfolio State
 
 Without a portfolio state, the cron starts from the default paper portfolio:

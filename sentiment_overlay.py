@@ -43,6 +43,7 @@ X_TOP_N = int(os.getenv("X_TOP_N", "12"))
 SENTIMENT_MAX_ADJUST = float(os.getenv("SENTIMENT_MAX_ADJUST", "0.12"))
 NEWS_TOP_N = int(os.getenv("NEWS_TOP_N", "12"))
 REQUEST_TIMEOUT = float(os.getenv("SENTIMENT_REQUEST_TIMEOUT", "6"))
+SOURCE_STATUS: dict[str, str] = {}
 
 
 POSITIVE_WORDS = {
@@ -108,6 +109,19 @@ def _sentiment_score(text: str) -> float:
     return max(-1.0, min(1.0, raw))
 
 
+def _reset_source_status():
+    SOURCE_STATUS.clear()
+    SOURCE_STATUS.update({
+        "reddit": "not checked",
+        "x": "not configured",
+        "google_news": "not checked",
+    })
+
+
+def _mark_source(source: str, status: str):
+    SOURCE_STATUS[source] = status
+
+
 def _source_weight(source: str) -> float:
     src = source.lower()
     for key, weight in SOURCE_WEIGHTS.items():
@@ -153,8 +167,10 @@ def _fetch_reddit_listing(
         )
         resp.raise_for_status()
         children = resp.json().get("data", {}).get("children", [])
+        _mark_source("reddit", "ok")
         return [child.get("data", {}) for child in children]
     except Exception as exc:
+        _mark_source("reddit", f"unavailable: {exc}")
         print(f"[sentiment] Reddit {listing} fetch failed: {exc}")
         return []
 
@@ -186,9 +202,11 @@ def _fetch_reddit_posts() -> list[dict]:
                 time.sleep(0.05)
             return _dedupe_posts(posts)
         except Exception as exc:
+            _mark_source("reddit", f"oauth failed: {exc}")
             print(f"[sentiment] Reddit OAuth fetch failed: {exc}")
             return []
 
+    _mark_source("reddit", "not configured; public JSON may be blocked")
     print(
         "[sentiment] Reddit OAuth credentials not set; attempting public "
         "JSON listings, which Reddit may block."
@@ -205,6 +223,7 @@ def _fetch_reddit_posts() -> list[dict]:
 
 def _fetch_x_posts(tickers: list[str]) -> list[dict]:
     if not X_BEARER_TOKEN:
+        _mark_source("x", "not configured")
         return []
     selected = tickers[:X_TOP_N]
     cashtags = " OR ".join(f"${ticker}" for ticker in selected)
@@ -221,8 +240,13 @@ def _fetch_x_posts(tickers: list[str]) -> list[dict]:
             timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
+        _mark_source("x", "ok")
         return resp.json().get("data", [])
     except Exception as exc:
+        if getattr(getattr(exc, "response", None), "status_code", None) == 402:
+            _mark_source("x", "unavailable: X API plan requires paid recent-search access")
+        else:
+            _mark_source("x", f"unavailable: {exc}")
         print(f"[sentiment] X recent search failed: {exc}")
         return []
 
@@ -236,7 +260,9 @@ def _parse_rss(url: str) -> list[dict]:
         )
         resp.raise_for_status()
         root = ET.fromstring(resp.content)
+        _mark_source("google_news", "ok")
     except Exception as exc:
+        _mark_source("google_news", f"unavailable: {exc}")
         print(f"[sentiment] RSS fetch failed: {url}: {exc}")
         return []
 
@@ -282,6 +308,7 @@ def build_sentiment_overlay(
     """Return one row per ticker with attention and score adjustment columns."""
     if scored_df.empty:
         return pd.DataFrame()
+    _reset_source_status()
 
     tickers = list(dict.fromkeys(tickers))
     stats = {ticker: MentionStats(ticker=ticker) for ticker in tickers}
@@ -434,17 +461,21 @@ def build_sentiment_overlay(
         )
         item.adjusted_prob_buy = float(base_probs.get(ticker, 0.0)) + item.sentiment_adjustment
 
-    return pd.DataFrame([asdict(item) for item in stats.values()])
+    out = pd.DataFrame([asdict(item) for item in stats.values()])
+    out.attrs["source_status"] = dict(SOURCE_STATUS)
+    return out
 
 
 def apply_sentiment_overlay(scored_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     if scored_df.empty:
         return scored_df, pd.DataFrame()
     overlay = build_sentiment_overlay(scored_df, scored_df["ticker"].tolist())
+    source_status = overlay.attrs.get("source_status", dict(SOURCE_STATUS))
     if overlay.empty:
         scored_df = scored_df.copy()
         scored_df["base_prob_buy"] = scored_df["prob_buy"]
         scored_df["sentiment_adjustment"] = 0.0
+        scored_df.attrs["source_status"] = source_status
         return scored_df, overlay
 
     merged = scored_df.merge(
@@ -465,4 +496,7 @@ def apply_sentiment_overlay(scored_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.D
     )
     merged["prob_buy"] = merged["adjusted_prob_buy"]
     merged = merged.sort_values("prob_buy", ascending=False).reset_index(drop=True)
-    return merged, overlay.sort_values("adjusted_prob_buy", ascending=False).reset_index(drop=True)
+    merged.attrs["source_status"] = source_status
+    sorted_overlay = overlay.sort_values("adjusted_prob_buy", ascending=False).reset_index(drop=True)
+    sorted_overlay.attrs["source_status"] = source_status
+    return merged, sorted_overlay

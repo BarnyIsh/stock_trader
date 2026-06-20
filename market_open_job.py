@@ -8,6 +8,7 @@ model, computes paper buy/sell intents, and emails the result.
 import json
 import os
 import smtplib
+from html import escape
 from dataclasses import asdict
 from datetime import datetime
 from email.message import EmailMessage
@@ -82,7 +83,159 @@ def _plain_trade_table(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _send_email(subject: str, body: str):
+def _fmt_money(value: float) -> str:
+    return f"${float(value):,.2f}"
+
+
+def _fmt_pct(value: float) -> str:
+    return f"{float(value) * 100:.1f}%"
+
+
+def _source_badge(name: str, status: str) -> str:
+    ok = status == "ok"
+    color = "#0f766e" if ok else "#b45309"
+    bg = "#ccfbf1" if ok else "#fef3c7"
+    return (
+        f"<span style='display:inline-block;margin:4px 6px 4px 0;padding:5px 9px;"
+        f"border-radius:999px;background:{bg};color:{color};font-size:12px;"
+        f"font-weight:700'>{escape(name)}: {escape(status)}</span>"
+    )
+
+
+def _trade_rows_html(rows: list[dict]) -> str:
+    if not rows:
+        return (
+            "<div style='padding:14px;border:1px solid #e5e7eb;border-radius:8px;"
+            "background:#f9fafb;color:#374151'>No buy or sell intents today.</div>"
+        )
+
+    body = []
+    for row in rows:
+        action = row["action"]
+        color = "#166534" if action == "BUY" else "#991b1b"
+        detail = (
+            f"stop {_fmt_money(row.get('stop', 0))} / target {_fmt_money(row.get('target', 0))}"
+            if action == "BUY"
+            else escape(row.get("reason", ""))
+        )
+        body.append(
+            "<tr>"
+            f"<td style='padding:10px;font-weight:800;color:{color}'>{action}</td>"
+            f"<td style='padding:10px;font-weight:700'>{escape(row['ticker'])}</td>"
+            f"<td style='padding:10px;text-align:right'>{int(row['shares']):,}</td>"
+            f"<td style='padding:10px;text-align:right'>{_fmt_money(row['price'])}</td>"
+            f"<td style='padding:10px;text-align:right'>{_fmt_pct(row.get('prob_buy', 0))}</td>"
+            f"<td style='padding:10px'>{detail}</td>"
+            "</tr>"
+        )
+    return (
+        "<table style='width:100%;border-collapse:collapse;font-size:14px'>"
+        "<thead><tr style='background:#f3f4f6;color:#374151'>"
+        "<th style='padding:10px;text-align:left'>Action</th>"
+        "<th style='padding:10px;text-align:left'>Ticker</th>"
+        "<th style='padding:10px;text-align:right'>Shares</th>"
+        "<th style='padding:10px;text-align:right'>Price</th>"
+        "<th style='padding:10px;text-align:right'>Score</th>"
+        "<th style='padding:10px;text-align:left'>Notes</th>"
+        "</tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table>"
+    )
+
+
+def _top_scores_html(top: pd.DataFrame) -> str:
+    if top.empty:
+        return "<p>No model scores were available.</p>"
+
+    rows = []
+    for _, row in top.iterrows():
+        rows.append(
+            "<tr>"
+            f"<td style='padding:9px;font-weight:800'>{escape(str(row['ticker']))}</td>"
+            f"<td style='padding:9px;text-align:right'>{_fmt_money(row['price'])}</td>"
+            f"<td style='padding:9px;text-align:right'>{_fmt_pct(row['base_prob_buy'])}</td>"
+            f"<td style='padding:9px;text-align:right;color:#7c3aed'>{_fmt_pct(row['sentiment_adjustment'])}</td>"
+            f"<td style='padding:9px;text-align:right;font-weight:800'>{_fmt_pct(row['prob_buy'])}</td>"
+            f"<td style='padding:9px;text-align:right'>{int(row.get('news_mentions', 0))}</td>"
+            f"<td style='padding:9px;text-align:right'>{int(row.get('x_mentions', 0))}</td>"
+            f"<td style='padding:9px;text-align:right'>{int(row.get('reddit_mentions', 0))}</td>"
+            "</tr>"
+        )
+
+    return (
+        "<table style='width:100%;border-collapse:collapse;font-size:13px'>"
+        "<thead><tr style='background:#111827;color:white'>"
+        "<th style='padding:10px;text-align:left'>Ticker</th>"
+        "<th style='padding:10px;text-align:right'>Price</th>"
+        "<th style='padding:10px;text-align:right'>Base</th>"
+        "<th style='padding:10px;text-align:right'>Overlay</th>"
+        "<th style='padding:10px;text-align:right'>Final</th>"
+        "<th style='padding:10px;text-align:right'>News</th>"
+        "<th style='padding:10px;text-align:right'>X</th>"
+        "<th style='padding:10px;text-align:right'>Reddit</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def _build_html_email(
+    now_ny: datetime,
+    decisions: dict,
+    trade_rows: list[dict],
+    top: pd.DataFrame,
+    source_status: dict,
+) -> str:
+    source_html = "".join(
+        _source_badge(name, status)
+        for name, status in source_status.items()
+    )
+    return f"""\
+<!doctype html>
+<html>
+  <body style="margin:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;color:#111827">
+    <div style="max-width:860px;margin:0 auto;padding:24px">
+      <div style="background:#111827;color:white;padding:22px 24px;border-radius:12px 12px 0 0">
+        <div style="font-size:13px;color:#cbd5e1">Stock Trader Market-Open Intent Log</div>
+        <h1 style="margin:6px 0 0;font-size:24px">{now_ny:%A, %B %d, %Y}</h1>
+      </div>
+      <div style="background:white;padding:22px 24px;border-radius:0 0 12px 12px;border:1px solid #e5e7eb">
+        <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px">
+          <div style="padding:12px 14px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px">
+            <div style="font-size:12px;color:#6b7280">Portfolio Value</div>
+            <div style="font-size:18px;font-weight:800">{_fmt_money(decisions['portfolio_value'])}</div>
+          </div>
+          <div style="padding:12px 14px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px">
+            <div style="font-size:12px;color:#6b7280">Cash</div>
+            <div style="font-size:18px;font-weight:800">{_fmt_money(decisions['cash'])}</div>
+          </div>
+          <div style="padding:12px 14px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px">
+            <div style="font-size:12px;color:#6b7280">Drawdown</div>
+            <div style="font-size:18px;font-weight:800">{_fmt_pct(decisions['drawdown'])}</div>
+          </div>
+        </div>
+
+        <h2 style="font-size:18px;margin:20px 0 10px">Trade Intents</h2>
+        {_trade_rows_html(trade_rows)}
+
+        <h2 style="font-size:18px;margin:24px 0 10px">Data Sources</h2>
+        <div>{source_html}</div>
+
+        <h2 style="font-size:18px;margin:24px 0 10px">Top Adjusted Scores</h2>
+        {_top_scores_html(top)}
+
+        <p style="margin-top:18px;color:#6b7280;font-size:13px;line-height:1.5">
+          Final score = base ML probability plus a capped news/social attention overlay.
+          This is an intent log only; it does not place orders.
+        </p>
+      </div>
+    </div>
+  </body>
+</html>
+"""
+
+
+def _send_email(subject: str, body: str, html_body: str | None = None):
     smtp_host = os.getenv("SMTP_HOST", "").strip()
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
     smtp_user = os.getenv("SMTP_USER", "").strip()
@@ -100,6 +253,8 @@ def _send_email(subject: str, body: str):
     msg["From"] = email_from
     msg["To"] = email_to
     msg.set_content(body)
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
 
     with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as smtp:
         smtp.starttls()
@@ -158,6 +313,7 @@ def run_market_open_job(send_email: bool = True) -> dict:
         "rsi", "bb_pct",
     ]
     top = scored_df.head(10)[[c for c in top_cols if c in scored_df.columns]]
+    source_status = scored_df.attrs.get("source_status", {})
     subject = f"Stock Trader intents for {now_ny:%Y-%m-%d}"
     body = "\n".join([
         f"Market-open model intents for {now_ny:%Y-%m-%d %H:%M %Z}",
@@ -178,6 +334,13 @@ def run_market_open_job(send_email: bool = True) -> dict:
         "",
         "This email is an intent log only; it does not place orders.",
     ])
+    html_body = _build_html_email(
+        now_ny=now_ny,
+        decisions=decisions,
+        trade_rows=trade_rows,
+        top=top,
+        source_status=source_status,
+    )
 
     log_entry = {
         "date": now_ny.isoformat(),
@@ -188,6 +351,7 @@ def run_market_open_job(send_email: bool = True) -> dict:
             "drawdown": decisions["drawdown"],
         },
         "top_scores": top.to_dict(orient="records"),
+        "source_status": source_status,
         "sentiment_overlay": overlay_df.head(25).to_dict(orient="records"),
         "positions": {
             ticker: asdict(position)
@@ -198,7 +362,7 @@ def run_market_open_job(send_email: bool = True) -> dict:
     log_file.write_text(json.dumps(log_entry, indent=2, default=str))
 
     if send_email:
-        _send_email(subject, body)
+        _send_email(subject, body, html_body=html_body)
 
     return {
         "ok": True,

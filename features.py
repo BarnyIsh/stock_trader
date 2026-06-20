@@ -8,6 +8,11 @@ Critical: no future leakage — every feature uses only data available
 at or before that day's CLOSE.
 """
 
+import os
+if os.getenv("VERCEL"):
+    os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
+    os.environ.setdefault("HOME", "/tmp")
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -19,6 +24,12 @@ from config       import (
     RSI_PERIOD, MACD_FAST, MACD_SLOW, MACD_SIGNAL, BB_PERIOD, BB_STD,
     BENCHMARK_TICKER,
 )
+
+if os.getenv("VERCEL"):
+    cache_dir = "/tmp/py-yfinance"
+    os.makedirs(cache_dir, exist_ok=True)
+    if hasattr(yf, "set_tz_cache_location"):
+        yf.set_tz_cache_location(cache_dir)
 
 
 def download_ohlcv(ticker: str, start: str, end: str) -> pd.DataFrame:

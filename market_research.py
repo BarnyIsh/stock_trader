@@ -37,27 +37,33 @@ def get_sp500_tickers() -> list[str]:
     except Exception:
         pass
 
-    # Source 2: Wikipedia with a browser-like User-Agent header
+    # Source 2: Wikipedia official REST API (no auth, no scraping, no 403)
     try:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        }
+        from io import StringIO
         resp = requests.get(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-            headers=headers, timeout=10
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action":  "parse",
+                "page":    "List of S&P 500 companies",
+                "prop":    "text",
+                "format":  "json",
+                "section": "0",
+            },
+            headers={"User-Agent": "AlgoTrader/1.0 (educational project)"},
+            timeout=15,
         )
         resp.raise_for_status()
-        tables = pd.read_html(resp.text)
-        tickers = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
-        if len(tickers) > 400:
-            print(f"  [universe] Loaded {len(tickers)} tickers from Wikipedia.")
-            return tickers
+        html = resp.json()["parse"]["text"]["*"]
+        tables = pd.read_html(StringIO(html))
+        # First table on the page is the constituent list
+        for table in tables:
+            for col in ["Symbol", "Ticker", "ticker", "symbol"]:
+                if col in table.columns and len(table) > 400:
+                    tickers = table[col].str.replace(".", "-", regex=False).tolist()
+                    print(f"  [universe] Loaded {len(tickers)} tickers from Wikipedia API.")
+                    return tickers
     except Exception as e:
-        print(f"  [universe] Wikipedia fetch failed: {e}")
+        print(f"  [universe] Wikipedia API failed: {e}")
 
     # Source 3: hardcoded comprehensive list (top ~150 S&P 500 by market cap)
     print("  [universe] Using built-in ticker list.")
@@ -103,21 +109,24 @@ def get_nasdaq100_tickers() -> list[str]:
     except Exception:
         pass
 
-    # Source 2: Wikipedia with browser header
+    # Source 2: Wikipedia official API for Nasdaq-100
     try:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        }
+        from io import StringIO
         resp = requests.get(
-            "https://en.wikipedia.org/wiki/Nasdaq-100",
-            headers=headers, timeout=10
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action":  "parse",
+                "page":    "Nasdaq-100",
+                "prop":    "text",
+                "format":  "json",
+                "section": "0",
+            },
+            headers={"User-Agent": "AlgoTrader/1.0 (educational project)"},
+            timeout=15,
         )
         resp.raise_for_status()
-        tables = pd.read_html(resp.text)
+        html = resp.json()["parse"]["text"]["*"]
+        tables = pd.read_html(StringIO(html))
         for table in tables:
             for col in ["Ticker", "Symbol", "ticker", "symbol"]:
                 if col in table.columns and len(table) > 80:

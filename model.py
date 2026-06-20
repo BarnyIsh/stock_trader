@@ -11,6 +11,7 @@ Architecture:
 
 import json
 import joblib
+import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -24,16 +25,23 @@ from sklearn.metrics         import (
     classification_report, roc_auc_score,
     precision_score, recall_score, f1_score
 )
-from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.calibration     import CalibratedClassifierCV
 
 from features import (
-    build_feature_matrix, download_ohlcv, add_technical_features, FEATURE_COLS
+    build_feature_matrix, build_benchmark_features,
+    download_ohlcv, add_technical_features, FEATURE_COLS
 )
-from config import TRAINING_START, TRAINING_END, TEST_START, TEST_END
+from config import TRAINING_START, TRAINING_END, TEST_START, TEST_END, BENCHMARK_TICKER
 
 MODEL_DIR = Path(__file__).parent / "models"
 MODEL_DIR.mkdir(exist_ok=True)
+LOG_DIR = (
+    Path("/tmp/stock_trader_logs")
+    if os.getenv("VERCEL")
+    else Path(__file__).parent / "logs"
+)
+LOG_DIR.mkdir(exist_ok=True)
 
 
 # ─── Walk-forward CV (within training window only) ───────────────────────────
@@ -67,6 +75,142 @@ def walk_forward_cv(X: pd.DataFrame, y: pd.Series, n_splits: int = 5) -> dict:
         }
         print(f"  [{name}] AUC = {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
     return scores
+
+
+def _new_model_suite() -> dict:
+    return {
+        "rf": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", RandomForestClassifier(
+                n_estimators=200, max_depth=8, min_samples_leaf=20,
+                class_weight="balanced", n_jobs=-1, random_state=42
+            )),
+        ]),
+        "gb": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", GradientBoostingClassifier(
+                n_estimators=150, max_depth=4, learning_rate=0.05,
+                subsample=0.8, random_state=42
+            )),
+        ]),
+        "lr": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(
+                C=0.5, class_weight="balanced",
+                max_iter=500, random_state=42
+            )),
+        ]),
+    }
+
+
+def _predict_ensemble(models: dict, X: pd.DataFrame) -> np.ndarray:
+    p_rf = models["rf"].predict_proba(X)[:, 1]
+    p_gb = models["gb"].predict_proba(X)[:, 1]
+    p_lr = models["lr"].predict_proba(X)[:, 1]
+    return 0.40 * p_rf + 0.40 * p_gb + 0.20 * p_lr
+
+
+def _signal_profit_pct(df: pd.DataFrame, threshold: float = 0.55) -> float:
+    signals = df[df["prob_buy"] >= threshold]
+    returns = signals["future_return"].dropna()
+    if returns.empty:
+        return 0.0
+    return float(returns.mean() * 100.0)
+
+
+def _benchmark_profit_pct(df: pd.DataFrame) -> float:
+    if df.empty or "benchmark_ret_5" not in df:
+        return 0.0
+    daily = (
+        df[["date", "benchmark_ret_5"]]
+        .dropna()
+        .drop_duplicates(subset=["date"])
+    )
+    if daily.empty:
+        return 0.0
+    return float(daily["benchmark_ret_5"].mean() * 100.0)
+
+
+def walk_forward_cv(train_df: pd.DataFrame, n_splits: int = 5) -> dict:
+    """Walk-forward validation by date with train/test profit logging."""
+    unique_dates = np.array(sorted(pd.to_datetime(train_df["date"]).unique()))
+    rows = []
+    date_values = pd.to_datetime(train_df["date"])
+
+    for fold, (train_idx, test_idx) in enumerate(
+        TimeSeriesSplit(n_splits=n_splits).split(unique_dates),
+        start=1,
+    ):
+        train_dates = set(unique_dates[train_idx])
+        test_dates = set(unique_dates[test_idx])
+        fold_train = train_df[date_values.isin(train_dates)]
+        fold_test = train_df[date_values.isin(test_dates)]
+
+        models = _new_model_suite()
+        X_fold_train = fold_train[FEATURE_COLS].fillna(0)
+        y_fold_train = fold_train["label"]
+        X_fold_test = fold_test[FEATURE_COLS].fillna(0)
+        y_fold_test = fold_test["label"]
+
+        for model in models.values():
+            model.fit(X_fold_train, y_fold_train)
+
+        train_prob = _predict_ensemble(models, X_fold_train)
+        test_prob = _predict_ensemble(models, X_fold_test)
+        train_eval = fold_train.copy()
+        test_eval = fold_test.copy()
+        train_eval["prob_buy"] = train_prob
+        test_eval["prob_buy"] = test_prob
+
+        auc = roc_auc_score(y_fold_test, test_prob)
+        row = {
+            "fold": fold,
+            "train_start": str(fold_train["date"].min().date()),
+            "train_end": str(fold_train["date"].max().date()),
+            "test_start": str(fold_test["date"].min().date()),
+            "test_end": str(fold_test["date"].max().date()),
+            "train_samples": int(len(fold_train)),
+            "test_samples": int(len(fold_test)),
+            "test_auc": float(auc),
+            "train_profit_pct": _signal_profit_pct(train_eval),
+            "test_profit_pct": _signal_profit_pct(test_eval),
+            "benchmark_profit_pct": _benchmark_profit_pct(test_eval),
+            "test_signal_count": int((test_prob >= 0.55).sum()),
+        }
+        rows.append(row)
+        print(
+            f"  [fold {fold}] AUC={row['test_auc']:.3f}  "
+            f"train profit={row['train_profit_pct']:.2f}%  "
+            f"test profit={row['test_profit_pct']:.2f}%  "
+            f"benchmark={row['benchmark_profit_pct']:.2f}%"
+        )
+
+    out = pd.DataFrame(rows)
+    return {
+        "mean_auc": float(out["test_auc"].mean()),
+        "mean_train_profit_pct": float(out["train_profit_pct"].mean()),
+        "mean_test_profit_pct": float(out["test_profit_pct"].mean()),
+        "mean_benchmark_profit_pct": float(out["benchmark_profit_pct"].mean()),
+        "folds": rows,
+    }
+
+
+def _calibrated_feature_importances(calibrated: CalibratedClassifierCV) -> np.ndarray:
+    """Average feature importances from fitted calibrated base estimators."""
+    fitted = getattr(calibrated, "calibrated_classifiers_", [])
+    importances = []
+    for item in fitted:
+        estimator = getattr(item, "estimator", None)
+        if estimator is not None and hasattr(estimator, "feature_importances_"):
+            importances.append(estimator.feature_importances_)
+    if importances:
+        return np.mean(importances, axis=0)
+
+    estimator = getattr(calibrated, "estimator", None)
+    if estimator is not None and hasattr(estimator, "feature_importances_"):
+        return estimator.feature_importances_
+
+    return np.zeros(len(FEATURE_COLS))
 
 
 # ─── Full model train ─────────────────────────────────────────────────────────
@@ -106,7 +250,7 @@ def train_model(
     # Walk-forward CV (training window only)
     if verbose:
         print("\nWalk-forward CV results:")
-    cv_scores = walk_forward_cv(X_train, y_train)
+    cv_scores = walk_forward_cv(train_df)
 
     # ── Ensemble definition ──────────────────────────────────────────────────
     rf = Pipeline([
@@ -142,8 +286,8 @@ def train_model(
     lr.fit(X_train, y_train)
 
     # Feature importances from tree models
-    rf_fi = rf.named_steps["clf"].estimator.feature_importances_
-    gb_fi = gb.named_steps["clf"].estimator.feature_importances_
+    rf_fi = _calibrated_feature_importances(rf.named_steps["clf"])
+    gb_fi = _calibrated_feature_importances(gb.named_steps["clf"])
     fi_df = pd.DataFrame({
         "feature": FEATURE_COLS,
         "rf_importance": rf_fi,
@@ -174,14 +318,21 @@ def train_model(
         "n_samples":     int(len(X_train)),
         "forward_days":  forward_days,
         "min_return":    min_return,
+        "benchmark":     BENCHMARK_TICKER,
         "cv_scores":     cv_scores,
         "feature_cols":  FEATURE_COLS,
     }
     (MODEL_DIR / "metadata.json").write_text(
         json.dumps(metadata, indent=2, default=str)
     )
+    log_path = LOG_DIR / f"training_{ts}.json"
+    log_path.write_text(json.dumps(metadata, indent=2, default=str))
+    pd.DataFrame(cv_scores["folds"]).to_csv(
+        LOG_DIR / f"training_folds_{ts}.csv", index=False
+    )
     if verbose:
         print(f"\nModels saved to {MODEL_DIR}/")
+        print(f"Training logs saved to {log_path}")
 
     return {"models": {"rf": rf, "gb": gb, "lr": lr}, "metadata": metadata, "fi": fi_df}
 
@@ -222,7 +373,7 @@ def evaluate_on_test(
     p_rf = models["rf"].predict_proba(X_test)[:, 1]
     p_gb = models["gb"].predict_proba(X_test)[:, 1]
     p_lr = models["lr"].predict_proba(X_test)[:, 1]
-    ensemble_prob = (0.40 * p_rf + 0.40 * p_gb + 0.20 * p_lr)
+    ensemble_prob = _predict_ensemble(models, X_test)
 
     test_df["prob_buy"]    = ensemble_prob
     test_df["signal"]      = (ensemble_prob >= 0.55).astype(int)
@@ -237,8 +388,29 @@ def evaluate_on_test(
         print(f"Precision: {precision_score(y_test, preds, zero_division=0):.4f}")
         print(f"Recall:    {recall_score(y_test, preds, zero_division=0):.4f}")
         print(f"F1:        {f1_score(y_test, preds, zero_division=0):.4f}")
+        print(f"Signal profit: {_signal_profit_pct(test_df):.2f}%")
+        print(f"{BENCHMARK_TICKER} benchmark: {_benchmark_profit_pct(test_df):.2f}%")
         print(f"\nClassification Report:")
         print(classification_report(y_test, preds, target_names=["Hold","Buy"]))
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        eval_log = {
+            "evaluated_at": ts,
+            "test_start": TEST_START,
+            "test_end": TEST_END,
+            "tickers": tickers,
+            "signal_profit_pct": _signal_profit_pct(test_df),
+            "benchmark_profit_pct": _benchmark_profit_pct(test_df),
+            "signal_count": int(test_df["signal"].sum()),
+            "rows": int(len(test_df)),
+            "roc_auc": float(auc),
+            "precision": float(precision_score(y_test, preds, zero_division=0)),
+            "recall": float(recall_score(y_test, preds, zero_division=0)),
+            "f1": float(f1_score(y_test, preds, zero_division=0)),
+        }
+        (LOG_DIR / f"test_evaluation_{ts}.json").write_text(
+            json.dumps(eval_log, indent=2, default=str)
+        )
 
     return test_df
 
@@ -270,12 +442,17 @@ def score_today(
         feature_cols = model_bundle["metadata"]["feature_cols"]
 
     rows = []
+    benchmark_df = build_benchmark_features(TEST_START, TEST_END)
     for ticker in tickers:
         try:
             df = download_ohlcv(ticker, start=TEST_START, end=TEST_END)
             if len(df) < 60:
                 continue
             df = add_technical_features(df)
+            if not benchmark_df.empty:
+                df = df.join(benchmark_df, how="left")
+                df["relative_roc_5"] = df["roc_5"] - df["benchmark_ret_5"]
+                df["relative_roc_20"] = df["roc_20"] - df["benchmark_ret_20"]
             df = df.dropna(subset=feature_cols)
             if df.empty:
                 continue

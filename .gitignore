@@ -49,6 +49,12 @@ models/
 *.joblib
 *.json
 !README.md
+!vercel.json
+!models/
+!models/metadata.json
+!models/rf_latest.pkl
+!models/gb_latest.pkl
+!models/lr_latest.pkl
 
 # Credentials
 api_keys/

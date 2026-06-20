@@ -15,7 +15,10 @@ from ta.trend     import MACD, EMAIndicator, SMAIndicator, ADXIndicator
 from ta.momentum  import RSIIndicator, StochasticOscillator
 from ta.volatility import BollingerBands, AverageTrueRange
 from ta.volume    import OnBalanceVolumeIndicator, MFIIndicator
-from config       import RSI_PERIOD, MACD_FAST, MACD_SLOW, MACD_SIGNAL, BB_PERIOD, BB_STD
+from config       import (
+    RSI_PERIOD, MACD_FAST, MACD_SLOW, MACD_SIGNAL, BB_PERIOD, BB_STD,
+    BENCHMARK_TICKER,
+)
 
 
 def download_ohlcv(ticker: str, start: str, end: str) -> pd.DataFrame:
@@ -123,9 +126,31 @@ def add_labels(
     Add binary label: 1 if forward return ≥ min_return, else 0.
     The label is computed using future data — training only!
     """
-    df["future_return"] = df["close"].pct_change(forward_days).shift(-forward_days)
-    df["label"]         = (df["future_return"] >= min_return).astype(int)
+    df["future_return"] = df["close"].shift(-forward_days) / df["close"] - 1
+    valid = df["future_return"].notna()
+    df["label"] = np.nan
+    df.loc[valid, "label"] = (
+        df.loc[valid, "future_return"] >= min_return
+    ).astype(int)
     return df
+
+
+def build_benchmark_features(
+    start: str,
+    end: str,
+    benchmark: str = BENCHMARK_TICKER,
+) -> pd.DataFrame:
+    """Build market benchmark features known at each close."""
+    bench = download_ohlcv(benchmark, start=start, end=end)
+    if bench.empty:
+        return pd.DataFrame()
+
+    close = bench["close"]
+    out = pd.DataFrame(index=bench.index)
+    out["benchmark_ret_5"] = close.pct_change(5)
+    out["benchmark_ret_20"] = close.pct_change(20)
+    out["benchmark_volatility_20d"] = close.pct_change().rolling(20).std()
+    return out
 
 
 def build_feature_matrix(
@@ -134,17 +159,23 @@ def build_feature_matrix(
     end: str,
     label: bool = True,
     forward_days: int = 5,
+    benchmark: str = BENCHMARK_TICKER,
 ) -> pd.DataFrame:
     """
     Build the full feature matrix for a list of tickers over a date range.
     Returns a long-format DataFrame with a 'ticker' column.
     """
     frames = []
+    benchmark_df = build_benchmark_features(start, end, benchmark=benchmark)
     for ticker in tickers:
         df = download_ohlcv(ticker, start, end)
         if df.empty or len(df) < 60:
             continue
         df = add_technical_features(df)
+        if not benchmark_df.empty:
+            df = df.join(benchmark_df, how="left")
+            df["relative_roc_5"] = df["roc_5"] - df["benchmark_ret_5"]
+            df["relative_roc_20"] = df["roc_20"] - df["benchmark_ret_20"]
         if label:
             df = add_labels(df, forward_days=forward_days)
         df["ticker"] = ticker
@@ -158,7 +189,10 @@ def build_feature_matrix(
     feature_cols = [c for c in out.columns
                     if c not in ("ticker","future_return","label","volume")]
     out = out.dropna(subset=feature_cols)
-    return out.reset_index()
+    if label:
+        out = out.dropna(subset=["future_return", "label"])
+        out["label"] = out["label"].astype(int)
+    return out.reset_index().sort_values(["date", "ticker"]).reset_index(drop=True)
 
 
 # ─── Feature column selector ─────────────────────────────────────────────────
@@ -175,4 +209,6 @@ FEATURE_COLS = [
     "pct_from_52w_high","pct_from_52w_low",
     "volume_ratio","obv","mfi",
     "body","upper_wick","lower_wick","is_bullish",
+    "benchmark_ret_5","benchmark_ret_20","benchmark_volatility_20d",
+    "relative_roc_5","relative_roc_20",
 ]

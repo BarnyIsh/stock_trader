@@ -18,6 +18,7 @@ Run modes:
 
 import argparse
 import json
+import os
 import time
 import pandas as pd
 from datetime    import datetime
@@ -31,8 +32,14 @@ from portfolio       import Portfolio
 from schwab_client   import SchwabClient
 
 
-LOG_DIR = Path(__file__).parent / "logs"
+LOG_DIR = (
+    Path("/tmp/stock_trader_logs")
+    if os.getenv("VERCEL")
+    else Path(__file__).parent / "logs"
+)
 LOG_DIR.mkdir(exist_ok=True)
+LOG_INTENT_HOLD_DAYS = 5
+LOG_REBUY_WAIT_DAYS = 10
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -82,6 +89,16 @@ def get_live_prices(
         val = data[col].dropna().iloc[-1] if not data[col].dropna().empty else 0
         prices[col] = float(val)
     return prices
+
+
+def append_trade_execution_log(entries: list[dict]):
+    """Append paper/live trade attempts to a durable JSONL audit log."""
+    if not entries:
+        return
+    path = LOG_DIR / "trades.jsonl"
+    with path.open("a", encoding="utf-8") as f:
+        for entry in entries:
+            f.write(json.dumps(entry, default=str) + "\n")
 
 
 # ─── OAuth2 setup ─────────────────────────────────────────────────────────────
@@ -260,6 +277,41 @@ def run_daily_session(client: SchwabClient):
     print(f"\n[5/5] Executing trades "
           f"({'PAPER' if PAPER_TRADING else 'LIVE'})…")
 
+    # Write human-readable intent log before executing trades
+    intent_lines = []
+    intent_lines.append("TRADE INTENT SUMMARY")
+    intent_lines.append(f"date: {datetime.now().isoformat()}")
+    intent_lines.append(f"portfolio_value: {decisions['portfolio_value']:.2f}")
+    intent_lines.append(f"drawdown: {decisions['drawdown']:.2%}")
+    intent_lines.append("")
+    intent_lines.append("SELL INTENTS:")
+    if decisions["sells"]:
+        for ticker, shares, reason in decisions["sells"]:
+            intent_lines.append(
+                f"  SELL {shares} × {ticker} now — reason: {reason} — "
+                f"planned BUY back after {LOG_REBUY_WAIT_DAYS} days or when model signals BUY"
+            )
+    else:
+        intent_lines.append("  (none)")
+
+    intent_lines.append("")
+    intent_lines.append("BUY INTENTS:")
+    if decisions["buys"]:
+        for ticker, shares, limit, stop, target in decisions["buys"]:
+            intent_lines.append(
+                f"  BUY  {shares} × {ticker} @ ${limit:.2f}  stop: ${stop:.2f}  "
+                f"target: ${target:.2f}  — planned SELL in {LOG_INTENT_HOLD_DAYS} days or when target reached"
+            )
+    else:
+        intent_lines.append("  (none)")
+
+    intent_lines.append("")
+    intent_lines.append("Notes: 'planned' timings are heuristics for human review only.")
+
+    intent_file = LOG_DIR / f"intent_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    intent_file.write_text("\n".join(intent_lines))
+    print(f"\nIntent log saved → {intent_file}")
+
     print(f"\n  → Sells ({len(decisions['sells'])}):")
     if decisions["sells"]:
         portfolio.apply_sells(decisions["sells"], prices)
@@ -284,6 +336,35 @@ def run_daily_session(client: SchwabClient):
     else:
         print("  (none)")
 
+    execution_log = []
+    for ticker, shares, reason in decisions["sells"]:
+        execution_log.append({
+            "date": datetime.now().isoformat(),
+            "mode": "PAPER" if PAPER_TRADING else "LIVE",
+            "action": "SELL",
+            "ticker": ticker,
+            "shares": int(shares),
+            "price": float(prices.get(ticker, 0)),
+            "order_type": "MARKET",
+            "reason": reason,
+            "status": "paper" if PAPER_TRADING else "submitted_or_attempted",
+        })
+    for ticker, shares, limit, stop, target in decisions["buys"]:
+        execution_log.append({
+            "date": datetime.now().isoformat(),
+            "mode": "PAPER" if PAPER_TRADING else "LIVE",
+            "action": "BUY",
+            "ticker": ticker,
+            "shares": int(shares),
+            "price": float(prices.get(ticker, limit)),
+            "order_type": "LIMIT",
+            "limit_price": float(limit),
+            "stop": float(stop),
+            "target": float(target),
+            "status": "paper" if PAPER_TRADING else "submitted_or_attempted",
+        })
+    append_trade_execution_log(execution_log)
+
     portfolio.save()
     portfolio.print_summary(prices)
 
@@ -294,8 +375,9 @@ def run_daily_session(client: SchwabClient):
         "drawdown":       decisions["drawdown"],
         "buys":           [(b[0], b[1], b[2]) for b in decisions["buys"]],
         "sells":          [(s[0], s[1], s[2]) for s in decisions["sells"]],
+        "executions":     execution_log,
     }
-    log_file = LOG_DIR / f"session_{datetime.now().strftime('%Y%m%d')}.json"
+    log_file = LOG_DIR / f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     log_file.write_text(json.dumps(log_entry, indent=2))
     print(f"\nSession log saved → {log_file}")
 

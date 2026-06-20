@@ -1,0 +1,19 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "crons": [
+    {
+      "path": "/api/market_open",
+      "schedule": "30 13 * * 1-5"
+    },
+    {
+      "path": "/api/market_open",
+      "schedule": "30 14 * * 1-5"
+    }
+  ],
+  "functions": {
+    "api/**/*.py": {
+      "maxDuration": 60,
+      "excludeFiles": "{logs/**,__pycache__/**,.venv/**,.git/**,*.zip}"
+    }
+  }
+}

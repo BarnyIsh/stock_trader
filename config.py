@@ -28,6 +28,7 @@ TRAINING_START = os.getenv("TRAINING_START", "2018-01-01")
 TRAINING_END   = os.getenv("TRAINING_END",   "2022-12-31")
 TEST_START     = os.getenv("TEST_START",     "2023-01-01")
 TEST_END       = datetime.today().strftime("%Y-%m-%d")
+BENCHMARK_TICKER = os.getenv("BENCHMARK_TICKER", "SPY")
 
 # ─── Universe screener watchlists ────────────────────────────────────────────
 # Sectors and sample tickers for initial universe — expanded dynamically

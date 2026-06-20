@@ -11,7 +11,7 @@
     }
   ],
   "functions": {
-    "api/**/*.py": {
+    "api/market_open.py": {
       "maxDuration": 60,
       "excludeFiles": "{logs/**,__pycache__/**,.venv/**,.git/**,*.zip}"
     }

@@ -74,6 +74,8 @@ X_TOP_N=12
 X_SEARCH_PAGES=2
 X_AUTH_TOKEN=<optional x auth_token cookie>
 X_CT0=<optional x ct0 cookie>
+PLAYWRIGHT_CDP_URL=<optional browserless/browserbase cdp websocket url>
+PLAYWRIGHT_WS_ENDPOINT=<optional playwright websocket endpoint>
 X_RUNTIME_BROWSER_INSTALL=false
 SENTIMENT_REQUEST_TIMEOUT=6
 ```
@@ -85,17 +87,16 @@ credentials are required. X is scraped with Playwright from search pages, so no
 X API key is required. X may
 redirect anonymous headless browsers to login; if that happens, set the
 optional `X_AUTH_TOKEN` and `X_CT0` cookie values from a browser session.
-Playwright needs a browser binary such as Chromium. This project uses Vercel's
-extended function limits beta, enabled by deploying with:
+Playwright needs a browser binary such as Chromium. Vercel's Python runtime can
+bundle the browser with extended function limits, but the runtime still lacks
+some shared Linux libraries needed to launch it. The reliable Vercel setup is a
+remote browser service. Set `PLAYWRIGHT_CDP_URL` for a Chrome DevTools Protocol
+endpoint, or `PLAYWRIGHT_WS_ENDPOINT` for a Playwright protocol endpoint. The X
+scraper still uses Playwright; it just connects to a browser running outside
+Vercel.
 
-```text
-vercel@54.13.0 deploy --functions-beta --prod
-```
-
-`vercel.json` installs the Playwright Chromium headless shell during the build
-and sets `PLAYWRIGHT_BROWSERS_PATH=playwright-browsers`, keeping the browser
-available to the X scraper at runtime. Without extended function limits, this
-bundle is too large for the standard 500 MB Python function limit.
+Reddit is fetched from public JSON endpoints. These URLs may open in your
+browser but still return 403 from Vercel because Reddit blocks some server IPs.
 Facebook/Meta public post search is not included by default because useful
 public content access requires approved Meta Graph API permissions.
 

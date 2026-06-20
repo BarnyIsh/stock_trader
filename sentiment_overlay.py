@@ -42,6 +42,8 @@ X_SEARCH_PAGES = int(os.getenv("X_SEARCH_PAGES", "2"))
 X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "").strip()
 X_CT0 = os.getenv("X_CT0", "").strip()
 X_RUNTIME_BROWSER_INSTALL = os.getenv("X_RUNTIME_BROWSER_INSTALL", "false").lower() == "true"
+PLAYWRIGHT_CDP_URL = os.getenv("PLAYWRIGHT_CDP_URL", "").strip()
+PLAYWRIGHT_WS_ENDPOINT = os.getenv("PLAYWRIGHT_WS_ENDPOINT", "").strip()
 SENTIMENT_MAX_ADJUST = float(os.getenv("SENTIMENT_MAX_ADJUST", "0.12"))
 NEWS_TOP_N = int(os.getenv("NEWS_TOP_N", "12"))
 REQUEST_TIMEOUT = float(os.getenv("SENTIMENT_REQUEST_TIMEOUT", "6"))
@@ -266,6 +268,13 @@ def _fetch_x_posts(tickers: list[str]) -> list[dict]:
         return _scrape_x_with_playwright(sync_playwright, PlaywrightTimeoutError, search_url)
     except Exception as exc:
         if "Executable doesn't exist" not in str(exc):
+            if _playwright_system_lib_missing(exc):
+                _mark_source(
+                    "x",
+                    "unavailable: local Chromium missing Linux libs; set PLAYWRIGHT_CDP_URL",
+                )
+                print(f"[sentiment] X scrape failed; local Chromium missing Linux libs: {exc}")
+                return []
             _mark_source("x", f"unavailable: scrape failed: {exc}")
             print(f"[sentiment] X scrape failed: {exc}")
             return []
@@ -290,14 +299,7 @@ def _fetch_x_posts(tickers: list[str]) -> list[dict]:
 
 def _scrape_x_with_playwright(sync_playwright, timeout_error, search_url: str) -> list[dict]:
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--no-sandbox",
-            ],
-        )
+        browser = _open_playwright_browser(p)
         context = browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent=(
@@ -347,6 +349,30 @@ def _scrape_x_with_playwright(sync_playwright, timeout_error, search_url: str) -
         else:
             _mark_source("x", "ok: no public posts found")
         return posts
+
+
+def _open_playwright_browser(playwright):
+    if PLAYWRIGHT_CDP_URL:
+        return playwright.chromium.connect_over_cdp(PLAYWRIGHT_CDP_URL)
+    if PLAYWRIGHT_WS_ENDPOINT:
+        return playwright.chromium.connect(PLAYWRIGHT_WS_ENDPOINT)
+    return playwright.chromium.launch(
+        headless=True,
+        args=[
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--no-sandbox",
+        ],
+    )
+
+
+def _playwright_system_lib_missing(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "error while loading shared libraries" in message
+        or "libnspr4.so" in message
+        or "libnss3.so" in message
+    )
 
 
 def _install_playwright_browser() -> bool:

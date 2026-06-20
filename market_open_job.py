@@ -92,7 +92,7 @@ def _fmt_pct(value: float) -> str:
 
 
 def _source_badge(name: str, status: str) -> str:
-    ok = status == "ok"
+    ok = status.startswith("ok")
     color = "#0f766e" if ok else "#b45309"
     bg = "#ccfbf1" if ok else "#fef3c7"
     return (
@@ -156,9 +156,9 @@ def _top_scores_html(top: pd.DataFrame) -> str:
             f"<td style='padding:9px;text-align:right'>{_fmt_pct(row['base_prob_buy'])}</td>"
             f"<td style='padding:9px;text-align:right;color:#7c3aed'>{_fmt_pct(row['sentiment_adjustment'])}</td>"
             f"<td style='padding:9px;text-align:right;font-weight:800'>{_fmt_pct(row['prob_buy'])}</td>"
-            f"<td style='padding:9px;text-align:right'>{int(row.get('news_mentions', 0))}</td>"
             f"<td style='padding:9px;text-align:right'>{int(row.get('x_mentions', 0))}</td>"
             f"<td style='padding:9px;text-align:right'>{int(row.get('reddit_mentions', 0))}</td>"
+            f"<td style='padding:9px;text-align:right'>{int(row.get('news_mentions', 0))}</td>"
             "</tr>"
         )
 
@@ -170,9 +170,9 @@ def _top_scores_html(top: pd.DataFrame) -> str:
         "<th style='padding:10px;text-align:right'>Base</th>"
         "<th style='padding:10px;text-align:right'>Overlay</th>"
         "<th style='padding:10px;text-align:right'>Final</th>"
-        "<th style='padding:10px;text-align:right'>News</th>"
         "<th style='padding:10px;text-align:right'>X</th>"
         "<th style='padding:10px;text-align:right'>Reddit</th>"
+        "<th style='padding:10px;text-align:right'>Google</th>"
         "</tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
@@ -309,7 +309,7 @@ def run_market_open_job(send_email: bool = True) -> dict:
 
     top_cols = [
         "ticker", "price", "base_prob_buy", "sentiment_adjustment", "prob_buy",
-        "reddit_mentions", "x_mentions", "news_mentions", "attention_score",
+        "x_mentions", "reddit_mentions", "news_mentions", "attention_score",
         "rsi", "bb_pct",
     ]
     top = scored_df.head(10)[[c for c in top_cols if c in scored_df.columns]]

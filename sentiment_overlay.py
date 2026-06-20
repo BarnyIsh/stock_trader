@@ -11,6 +11,8 @@ from __future__ import annotations
 import math
 import os
 import re
+import subprocess
+import sys
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
@@ -46,6 +48,10 @@ SENTIMENT_MAX_ADJUST = float(os.getenv("SENTIMENT_MAX_ADJUST", "0.12"))
 NEWS_TOP_N = int(os.getenv("NEWS_TOP_N", "12"))
 REQUEST_TIMEOUT = float(os.getenv("SENTIMENT_REQUEST_TIMEOUT", "6"))
 SOURCE_STATUS: dict[str, str] = {}
+PLAYWRIGHT_BROWSER_PATH = os.getenv(
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "/tmp/playwright-browsers" if os.getenv("VERCEL") else "",
+).strip()
 
 
 POSITIVE_WORDS = {
@@ -114,8 +120,8 @@ def _sentiment_score(text: str) -> float:
 def _reset_source_status():
     SOURCE_STATUS.clear()
     SOURCE_STATUS.update({
-        "reddit": "not checked",
         "x": "not configured",
+        "reddit": "not checked",
         "google_news": "not checked",
     })
 
@@ -245,68 +251,108 @@ def _fetch_x_posts(tickers: list[str]) -> list[dict]:
     )
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--no-sandbox",
-                ],
-            )
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0 Safari/537.36"
-                ),
-            )
-            _add_x_session_cookies(context)
-            page = context.new_page()
-            page.goto(search_url, wait_until="domcontentloaded", timeout=int(REQUEST_TIMEOUT * 1000))
+        return _scrape_x_with_playwright(sync_playwright, PlaywrightTimeoutError, search_url)
+    except Exception as exc:
+        if "Executable doesn't exist" not in str(exc):
+            _mark_source("x", f"unavailable: scrape failed: {exc}")
+            print(f"[sentiment] X scrape failed: {exc}")
+            return []
 
-            posts: list[dict] = []
-            seen: set[str] = set()
-            for _ in range(max(X_SEARCH_PAGES, 1)):
-                try:
-                    page.wait_for_selector("article[data-testid='tweet']", timeout=3500)
-                except PlaywrightTimeoutError:
-                    break
+    if not _install_playwright_browser():
+        return []
 
-                articles = page.locator("article[data-testid='tweet']").all()
-                for article in articles:
-                    text = _x_article_text(article)
-                    if not text:
-                        continue
-                    key = re.sub(r"\s+", " ", text).strip()[:240]
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    posts.append({
-                        "text": text,
-                        "public_metrics": _x_article_metrics(article),
-                    })
-                    if len(posts) >= 100:
-                        break
+    try:
+        return _scrape_x_with_playwright(sync_playwright, PlaywrightTimeoutError, search_url)
+    except Exception as exc:
+        _mark_source("x", f"unavailable: scrape failed after browser install: {exc}")
+        print(f"[sentiment] X scrape failed after browser install: {exc}")
+        return []
+
+
+def _scrape_x_with_playwright(sync_playwright, timeout_error, search_url: str) -> list[dict]:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-sandbox",
+            ],
+        )
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0 Safari/537.36"
+            ),
+        )
+        _add_x_session_cookies(context)
+        page = context.new_page()
+        page.goto(search_url, wait_until="domcontentloaded", timeout=int(REQUEST_TIMEOUT * 1000))
+
+        posts: list[dict] = []
+        seen: set[str] = set()
+        for _ in range(max(X_SEARCH_PAGES, 1)):
+            try:
+                page.wait_for_selector("article[data-testid='tweet']", timeout=3500)
+            except timeout_error:
+                break
+
+            articles = page.locator("article[data-testid='tweet']").all()
+            for article in articles:
+                text = _x_article_text(article)
+                if not text:
+                    continue
+                key = re.sub(r"\s+", " ", text).strip()[:240]
+                if key in seen:
+                    continue
+                seen.add(key)
+                posts.append({
+                    "text": text,
+                    "public_metrics": _x_article_metrics(article),
+                })
                 if len(posts) >= 100:
                     break
-                page.mouse.wheel(0, 1600)
-                page.wait_for_timeout(900)
+            if len(posts) >= 100:
+                break
+            page.mouse.wheel(0, 1600)
+            page.wait_for_timeout(900)
 
-            login_required = _x_login_required(page)
-            browser.close()
-            if posts:
-                _mark_source("x", f"ok: scraped {len(posts)} posts")
-            elif login_required:
-                _mark_source("x", "unavailable: login required; set X_AUTH_TOKEN and X_CT0")
-            else:
-                _mark_source("x", "ok: no public posts found")
-            return posts
+        login_required = _x_login_required(page)
+        browser.close()
+        if posts:
+            _mark_source("x", f"ok: scraped {len(posts)} posts")
+        elif login_required:
+            _mark_source("x", "unavailable: login required; set X_AUTH_TOKEN and X_CT0")
+        else:
+            _mark_source("x", "ok: no public posts found")
+        return posts
+
+
+def _install_playwright_browser() -> bool:
+    install_path = "/tmp/playwright-browsers" if os.getenv("VERCEL") else (
+        PLAYWRIGHT_BROWSER_PATH or "/tmp/playwright-browsers"
+    )
+    env = os.environ.copy()
+    env["PLAYWRIGHT_BROWSERS_PATH"] = install_path
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = install_path
+
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "--only-shell", "chromium"],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        _mark_source("x", "retrying after browser install")
+        return True
     except Exception as exc:
-        _mark_source("x", f"unavailable: scrape failed: {exc}")
-        print(f"[sentiment] X scrape failed: {exc}")
-        return []
+        _mark_source("x", f"unavailable: browser install failed: {exc}")
+        print(f"[sentiment] Playwright browser install failed: {exc}")
+        return False
 
 
 def _add_x_session_cookies(context) -> None:

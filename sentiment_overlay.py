@@ -38,8 +38,10 @@ REDDIT_LISTINGS = [
     if item.strip()
 ]
 REDDIT_TOP_TIME_FILTER = os.getenv("REDDIT_TOP_TIME_FILTER", "day")
-X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
 X_TOP_N = int(os.getenv("X_TOP_N", "12"))
+X_SEARCH_PAGES = int(os.getenv("X_SEARCH_PAGES", "2"))
+X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "").strip()
+X_CT0 = os.getenv("X_CT0", "").strip()
 SENTIMENT_MAX_ADJUST = float(os.getenv("SENTIMENT_MAX_ADJUST", "0.12"))
 NEWS_TOP_N = int(os.getenv("NEWS_TOP_N", "12"))
 REQUEST_TIMEOUT = float(os.getenv("SENTIMENT_REQUEST_TIMEOUT", "6"))
@@ -222,33 +224,163 @@ def _fetch_reddit_posts() -> list[dict]:
 
 
 def _fetch_x_posts(tickers: list[str]) -> list[dict]:
-    if not X_BEARER_TOKEN:
-        _mark_source("x", "not configured")
-        return []
     selected = tickers[:X_TOP_N]
-    cashtags = " OR ".join(f"${ticker}" for ticker in selected)
-    query = f"({cashtags}) (stock OR stocks OR earnings OR shares OR market) -is:retweet lang:en"
-    try:
-        resp = requests.get(
-            "https://api.x.com/2/tweets/search/recent",
-            params={
-                "query": query,
-                "max_results": 100,
-                "tweet.fields": "created_at,public_metrics,lang",
-            },
-            headers={"Authorization": f"Bearer {X_BEARER_TOKEN}"},
-            timeout=REQUEST_TIMEOUT,
-        )
-        resp.raise_for_status()
-        _mark_source("x", "ok")
-        return resp.json().get("data", [])
-    except Exception as exc:
-        if getattr(getattr(exc, "response", None), "status_code", None) == 402:
-            _mark_source("x", "unavailable: X API plan requires paid recent-search access")
-        else:
-            _mark_source("x", f"unavailable: {exc}")
-        print(f"[sentiment] X recent search failed: {exc}")
+    if not selected:
+        _mark_source("x", "no tickers")
         return []
+
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        _mark_source("x", f"unavailable: Playwright import failed: {exc}")
+        print(f"[sentiment] X scrape skipped; Playwright import failed: {exc}")
+        return []
+
+    query = " OR ".join(f"${ticker}" for ticker in selected)
+    search_url = (
+        "https://x.com/search?"
+        f"q={quote_plus(f'({query}) (stock OR stocks OR earnings OR shares OR market) lang:en')}"
+        "&src=typed_query&f=live"
+    )
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--no-sandbox",
+                ],
+            )
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0 Safari/537.36"
+                ),
+            )
+            _add_x_session_cookies(context)
+            page = context.new_page()
+            page.goto(search_url, wait_until="domcontentloaded", timeout=int(REQUEST_TIMEOUT * 1000))
+
+            posts: list[dict] = []
+            seen: set[str] = set()
+            for _ in range(max(X_SEARCH_PAGES, 1)):
+                try:
+                    page.wait_for_selector("article[data-testid='tweet']", timeout=3500)
+                except PlaywrightTimeoutError:
+                    break
+
+                articles = page.locator("article[data-testid='tweet']").all()
+                for article in articles:
+                    text = _x_article_text(article)
+                    if not text:
+                        continue
+                    key = re.sub(r"\s+", " ", text).strip()[:240]
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    posts.append({
+                        "text": text,
+                        "public_metrics": _x_article_metrics(article),
+                    })
+                    if len(posts) >= 100:
+                        break
+                if len(posts) >= 100:
+                    break
+                page.mouse.wheel(0, 1600)
+                page.wait_for_timeout(900)
+
+            login_required = _x_login_required(page)
+            browser.close()
+            if posts:
+                _mark_source("x", f"ok: scraped {len(posts)} posts")
+            elif login_required:
+                _mark_source("x", "unavailable: login required; set X_AUTH_TOKEN and X_CT0")
+            else:
+                _mark_source("x", "ok: no public posts found")
+            return posts
+    except Exception as exc:
+        _mark_source("x", f"unavailable: scrape failed: {exc}")
+        print(f"[sentiment] X scrape failed: {exc}")
+        return []
+
+
+def _add_x_session_cookies(context) -> None:
+    if not (X_AUTH_TOKEN and X_CT0):
+        return
+    context.add_cookies([
+        {
+            "name": "auth_token",
+            "value": X_AUTH_TOKEN,
+            "domain": ".x.com",
+            "path": "/",
+            "secure": True,
+            "httpOnly": True,
+            "sameSite": "None",
+        },
+        {
+            "name": "ct0",
+            "value": X_CT0,
+            "domain": ".x.com",
+            "path": "/",
+            "secure": True,
+            "httpOnly": False,
+            "sameSite": "Lax",
+        },
+    ])
+
+
+def _x_login_required(page) -> bool:
+    try:
+        if "/i/jf/onboarding/web" in page.url or "mode=login" in page.url:
+            return True
+        text = page.locator("body").inner_text(timeout=1000).lower()
+        return "email or username" in text and "continue with" in text
+    except Exception:
+        return False
+
+
+def _x_article_text(article) -> str:
+    try:
+        parts = article.locator("div[data-testid='tweetText']").all_inner_texts()
+    except Exception:
+        return ""
+    text = " ".join(part.strip() for part in parts if part.strip())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _metric_from_label(label: str) -> int:
+    label = label.lower().replace(",", "")
+    match = re.search(r"([\d.]+)\s*([km]?)", label)
+    if not match:
+        return 0
+    value = float(match.group(1))
+    suffix = match.group(2)
+    if suffix == "k":
+        value *= 1_000
+    elif suffix == "m":
+        value *= 1_000_000
+    return int(value)
+
+
+def _x_article_metrics(article) -> dict:
+    metric_selectors = {
+        "reply_count": "[data-testid='reply']",
+        "retweet_count": "[data-testid='retweet']",
+        "like_count": "[data-testid='like']",
+    }
+    metrics = {key: 0 for key in metric_selectors}
+    for key, selector in metric_selectors.items():
+        try:
+            label = article.locator(selector).first.get_attribute("aria-label") or ""
+            metrics[key] = _metric_from_label(label)
+        except Exception:
+            metrics[key] = 0
+    return metrics
 
 
 def _parse_rss(url: str) -> list[dict]:

@@ -1,5 +1,15 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "PLAYWRIGHT_BROWSERS_PATH=0 python -m playwright install --only-shell chromium",
+  "env": {
+    "PLAYWRIGHT_BROWSERS_PATH": "0"
+  },
+  "functions": {
+    "api/market_open.py": {
+      "maxDuration": 60,
+      "excludeFiles": "{.git/**,.venv/**,__pycache__/**,logs/**,**/__pycache__/**,**/*.pyc}"
+    }
+  },
   "crons": [
     {
       "path": "/api/market_open",

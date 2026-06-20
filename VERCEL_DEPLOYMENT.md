@@ -72,17 +72,23 @@ REDDIT_TOP_TIME_FILTER=day
 REDDIT_USER_AGENT=windows:stock-trader-market-open:v1.0 (by /u/BarnyIsh)
 REDDIT_CLIENT_ID=<reddit app client id>
 REDDIT_CLIENT_SECRET=<reddit app client secret>
-X_BEARER_TOKEN=<x api bearer token>
 X_TOP_N=12
+X_SEARCH_PAGES=2
+X_AUTH_TOKEN=<optional x auth_token cookie>
+X_CT0=<optional x ct0 cookie>
 SENTIMENT_REQUEST_TIMEOUT=6
 ```
 
 `prob_buy` in the email is the adjusted score. `base_prob_buy` is the original
 ML score before the overlay. Reddit access works best with OAuth credentials;
-without them, the job tries public JSON listings but Reddit may block it. X
-recent-search is used only when `X_BEARER_TOKEN` is configured. Facebook/Meta
-public post search is not included by default because useful public content
-access requires approved Meta Graph API permissions.
+without them, the job tries public JSON listings but Reddit may block it. X is
+scraped with Playwright from search pages, so no X API key is required. X may
+redirect anonymous headless browsers to login; if that happens, set the
+optional `X_AUTH_TOKEN` and `X_CT0` cookie values from a browser session.
+`vercel.json` installs the Playwright Chromium headless shell during the Vercel
+build and sets `PLAYWRIGHT_BROWSERS_PATH=0` so the function can find the browser at runtime.
+Facebook/Meta public post search is not included by default because useful
+public content access requires approved Meta Graph API permissions.
 
 ## Optional Portfolio State
 

@@ -1,7 +1,7 @@
 # Vercel Market-Open Email Cron
 
 This project can run a Vercel Cron Job that emails the model's daily buy/sell
-intents at market open. It does not place trades.
+intents before market open every calendar day. It does not place trades.
 
 ## Endpoint
 
@@ -31,15 +31,16 @@ GET /api/market_open?secret=<CRON_SECRET>
 
 ## Schedule
 
-`vercel.json` schedules both:
+Vercel cron uses UTC. `vercel.json` schedules both:
 
 ```text
-30 13 * * 1-5
-30 14 * * 1-5
+30 13 * * *
+30 14 * * *
 ```
 
-Vercel cron uses UTC. The endpoint only runs during the New York market-open
-window, so one schedule covers daylight time and the other covers standard time.
+The endpoint only runs during the New York premarket email window, including
+weekends and market holidays, so one schedule covers daylight time and the other
+covers standard time.
 
 ## Required Environment Variables
 

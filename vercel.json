@@ -6,11 +6,11 @@
   "crons": [
     {
       "path": "/api/market_open",
-      "schedule": "30 13 * * 1-5"
+      "schedule": "30 13 * * *"
     },
     {
       "path": "/api/market_open",
-      "schedule": "30 14 * * 1-5"
+      "schedule": "30 14 * * *"
     }
   ]
 }

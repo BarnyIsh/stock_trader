@@ -26,12 +26,10 @@ def _authorized(handler: BaseHTTPRequestHandler, query: dict) -> bool:
     return auth == f"Bearer {secret}" or query_secret == secret
 
 
-def _market_open_window() -> bool:
+def _daily_premarket_window() -> bool:
     if os.getenv("DISABLE_MARKET_OPEN_TIME_GUARD", "").lower() == "true":
         return True
     now = datetime.now(ZoneInfo("America/New_York"))
-    if now.weekday() >= 5:
-        return False
     return time(9, 25) <= now.time() <= time(10, 5)
 
 
@@ -52,11 +50,11 @@ class handler(BaseHTTPRequestHandler):
                 _json_response(self, 500, {"ok": False, "error": str(exc)})
             return
 
-        if not _market_open_window():
+        if not _daily_premarket_window():
             _json_response(self, 200, {
                 "ok": True,
                 "skipped": True,
-                "reason": "outside_market_open_window",
+                "reason": "outside_daily_premarket_window",
             })
             return
 

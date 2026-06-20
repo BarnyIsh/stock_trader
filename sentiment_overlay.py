@@ -8,6 +8,7 @@ weights more reputable sources higher, and rewards unusual attention volume.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -211,10 +212,64 @@ def _fetch_reddit_listing(
         return [], error
 
 
+def _fetch_reddit_listing_with_playwright(
+    subreddit: str,
+    listing: str,
+    params: dict | None = None,
+) -> tuple[list[dict], str | None]:
+    if not (PLAYWRIGHT_CDP_URL or PLAYWRIGHT_WS_ENDPOINT):
+        return [], "remote browser not configured"
+
+    if listing == "hot":
+        url = f"https://www.reddit.com/r/{subreddit}.json"
+    else:
+        url = f"https://www.reddit.com/r/{subreddit}/{listing}.json"
+    if params:
+        query = "&".join(f"{key}={quote_plus(str(value))}" for key, value in params.items())
+        url = f"{url}?{query}"
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        return [], f"Playwright import failed: {exc}"
+
+    try:
+        with sync_playwright() as p:
+            browser = _open_playwright_browser(p)
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                user_agent=REDDIT_USER_AGENT,
+            )
+            page = context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=int(REQUEST_TIMEOUT * 1000))
+            text = page.locator("body").inner_text(timeout=int(REQUEST_TIMEOUT * 1000)).strip()
+            browser.close()
+
+        if text.startswith("{"):
+            payload = json.loads(text)
+        else:
+            match = re.search(r"({.*})", text, flags=re.DOTALL)
+            if not match:
+                return [], f"remote browser returned non-json content from {url}"
+            payload = json.loads(match.group(1))
+
+        rows = []
+        children = payload.get("data", {}).get("children", [])
+        for child in children:
+            post = child.get("data", {}) or {}
+            post.setdefault("subreddit", subreddit)
+            rows.append(post)
+        return rows, None
+    except Exception as exc:
+        return [], f"remote browser failed: {exc}"
+
+
 def _fetch_reddit_posts() -> list[dict]:
     headers = _reddit_headers()
     posts = []
     errors = []
+    browser_posts = []
+    browser_errors = []
     subreddits = _reddit_subreddit_names()
     if not subreddits:
         _mark_source("reddit", "not configured")
@@ -229,13 +284,22 @@ def _fetch_reddit_posts() -> list[dict]:
             posts.extend(rows)
             if error:
                 errors.append(error)
+                browser_rows, browser_error = _fetch_reddit_listing_with_playwright(
+                    subreddit, listing, params
+                )
+                browser_posts.extend(browser_rows)
+                if browser_error:
+                    browser_errors.append(f"r/{subreddit} {listing}: {browser_error}")
             time.sleep(0.05)
 
-    deduped = _dedupe_posts(posts)
+    deduped = _dedupe_posts(posts + browser_posts)
     if deduped:
-        _mark_source("reddit", f"ok: fetched {len(deduped)} posts")
+        if browser_posts:
+            _mark_source("reddit", f"ok: fetched {len(deduped)} posts via remote browser")
+        else:
+            _mark_source("reddit", f"ok: fetched {len(deduped)} posts")
     else:
-        sample = "; ".join(errors[:2])
+        sample = "; ".join((browser_errors or errors)[:2])
         if sample:
             _mark_source("reddit", f"unavailable: public JSON blocked ({sample})")
         else:

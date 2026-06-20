@@ -97,6 +97,8 @@ Vercel.
 
 Reddit is fetched from public JSON endpoints. These URLs may open in your
 browser but still return 403 from Vercel because Reddit blocks some server IPs.
+When a remote browser endpoint is configured, Reddit JSON fetches that are
+blocked from Vercel are retried through the same remote browser.
 Facebook/Meta public post search is not included by default because useful
 public content access requires approved Meta Graph API permissions.
 

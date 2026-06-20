@@ -1,8 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "PLAYWRIGHT_BROWSERS_PATH=playwright-browsers python -m playwright install --only-shell chromium",
   "env": {
-    "PLAYWRIGHT_BROWSERS_PATH": "playwright-browsers"
+    "PLAYWRIGHT_BROWSERS_PATH": "/tmp/playwright-browsers"
   },
   "crons": [
     {

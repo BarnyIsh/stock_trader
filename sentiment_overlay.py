@@ -341,6 +341,7 @@ def _install_playwright_browser() -> bool:
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = install_path
 
     try:
+        _mark_source("x", "installing browser in /tmp")
         subprocess.run(
             [sys.executable, "-m", "playwright", "install", "--only-shell", "chromium"],
             env=env,

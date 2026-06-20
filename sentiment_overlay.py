@@ -41,6 +41,7 @@ X_TOP_N = int(os.getenv("X_TOP_N", "12"))
 X_SEARCH_PAGES = int(os.getenv("X_SEARCH_PAGES", "2"))
 X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "").strip()
 X_CT0 = os.getenv("X_CT0", "").strip()
+X_RUNTIME_BROWSER_INSTALL = os.getenv("X_RUNTIME_BROWSER_INSTALL", "false").lower() == "true"
 SENTIMENT_MAX_ADJUST = float(os.getenv("SENTIMENT_MAX_ADJUST", "0.12"))
 NEWS_TOP_N = int(os.getenv("NEWS_TOP_N", "12"))
 REQUEST_TIMEOUT = float(os.getenv("SENTIMENT_REQUEST_TIMEOUT", "6"))
@@ -181,7 +182,7 @@ def _fetch_reddit_listing(
     listing: str,
     headers: dict,
     params: dict | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], str | None]:
     if listing == "hot":
         url = f"https://www.reddit.com/r/{subreddit}.json"
     else:
@@ -201,15 +202,17 @@ def _fetch_reddit_listing(
             post = child.get("data", {}) or {}
             post.setdefault("subreddit", subreddit)
             rows.append(post)
-        return rows
+        return rows, None
     except Exception as exc:
-        print(f"[sentiment] Reddit r/{subreddit} {listing} fetch failed: {exc}")
-        return []
+        error = f"r/{subreddit} {listing}: {exc}"
+        print(f"[sentiment] Reddit {error}")
+        return [], error
 
 
 def _fetch_reddit_posts() -> list[dict]:
     headers = _reddit_headers()
     posts = []
+    errors = []
     subreddits = _reddit_subreddit_names()
     if not subreddits:
         _mark_source("reddit", "not configured")
@@ -220,14 +223,21 @@ def _fetch_reddit_posts() -> list[dict]:
             params = None if listing == "hot" else {"limit": 75}
             if listing == "top" and params is not None:
                 params["t"] = REDDIT_TOP_TIME_FILTER
-            posts.extend(_fetch_reddit_listing(subreddit, listing, headers, params))
+            rows, error = _fetch_reddit_listing(subreddit, listing, headers, params)
+            posts.extend(rows)
+            if error:
+                errors.append(error)
             time.sleep(0.05)
 
     deduped = _dedupe_posts(posts)
     if deduped:
         _mark_source("reddit", f"ok: fetched {len(deduped)} posts")
     else:
-        _mark_source("reddit", "unavailable: public JSON returned no posts")
+        sample = "; ".join(errors[:2])
+        if sample:
+            _mark_source("reddit", f"unavailable: public JSON blocked ({sample})")
+        else:
+            _mark_source("reddit", "unavailable: public JSON returned no posts")
     return deduped
 
 
@@ -259,6 +269,13 @@ def _fetch_x_posts(tickers: list[str]) -> list[dict]:
             _mark_source("x", f"unavailable: scrape failed: {exc}")
             print(f"[sentiment] X scrape failed: {exc}")
             return []
+
+    if not X_RUNTIME_BROWSER_INSTALL:
+        _mark_source(
+            "x",
+            "unavailable: Chromium missing; use Vercel functions-beta or set X_RUNTIME_BROWSER_INSTALL=true",
+        )
+        return []
 
     if not _install_playwright_browser():
         return []

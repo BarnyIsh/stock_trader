@@ -4,12 +4,6 @@
   "env": {
     "PLAYWRIGHT_BROWSERS_PATH": "0"
   },
-  "functions": {
-    "api/**/*.py": {
-      "maxDuration": 60,
-      "excludeFiles": "{.git/**,.venv/**,__pycache__/**,logs/**,**/__pycache__/**,**/*.pyc}"
-    }
-  },
   "crons": [
     {
       "path": "/api/market_open",

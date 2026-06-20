@@ -86,7 +86,8 @@ scraped with Playwright from search pages, so no X API key is required. X may
 redirect anonymous headless browsers to login; if that happens, set the
 optional `X_AUTH_TOKEN` and `X_CT0` cookie values from a browser session.
 `vercel.json` installs the Playwright Chromium headless shell during the Vercel
-build and sets `PLAYWRIGHT_BROWSERS_PATH=0` so the function can find the browser at runtime.
+build and sets `PLAYWRIGHT_BROWSERS_PATH=0` so the function can find the
+browser at runtime.
 Facebook/Meta public post search is not included by default because useful
 public content access requires approved Meta Graph API permissions.
 

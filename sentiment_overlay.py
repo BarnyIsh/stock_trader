@@ -52,7 +52,7 @@ PLAYWRIGHT_CDP_URL = os.getenv("PLAYWRIGHT_CDP_URL", "").strip()
 PLAYWRIGHT_WS_ENDPOINT = os.getenv("PLAYWRIGHT_WS_ENDPOINT", "").strip()
 SENTIMENT_MAX_ADJUST = float(os.getenv("SENTIMENT_MAX_ADJUST", "0.12"))
 NEWS_TOP_N = int(os.getenv("NEWS_TOP_N", "12"))
-REQUEST_TIMEOUT = float(os.getenv("SENTIMENT_REQUEST_TIMEOUT", "6"))
+REQUEST_TIMEOUT = float(os.getenv("SENTIMENT_REQUEST_TIMEOUT", "10"))
 SOURCE_STATUS: dict[str, str] = {}
 PLAYWRIGHT_BROWSER_PATH = os.getenv(
     "PLAYWRIGHT_BROWSERS_PATH",
@@ -307,17 +307,24 @@ def _x_page_scrape(context, search_urls: list[str]) -> list[dict]:
 
     for search_url in search_urls:
         try:
-            page.goto(search_url, wait_until="domcontentloaded", timeout=int(REQUEST_TIMEOUT * 1000))
-        except Exception:
+            page.goto(search_url, wait_until="domcontentloaded", timeout=15000)
+        except Exception as exc:
+            if "closed" in str(exc).lower():
+                break  # browser killed — stop entirely
             continue
 
-        for _ in range(max(X_SEARCH_PAGES, 1)):
-            try:
-                page.wait_for_selector("article[data-testid='tweet']", timeout=3500)
-            except (PlaywrightTimeoutError, Exception):
-                empty_reason = _x_empty_reason(page)
+        # Wait for tweets to render (X is JS-heavy)
+        try:
+            page.wait_for_selector("article[data-testid='tweet']", timeout=8000)
+        except (PlaywrightTimeoutError, Exception):
+            empty_reason = _x_empty_reason(page)
+            if _x_login_required(page):
+                login_required = True
                 break
+            continue  # try next ticker
 
+        # Scrape visible tweets
+        try:
             articles = page.locator("article[data-testid='tweet']").all()
             for article in articles:
                 text = _x_article_text(article)
@@ -331,27 +338,52 @@ def _x_page_scrape(context, search_urls: list[str]) -> list[dict]:
                     "text": text,
                     "public_metrics": _x_article_metrics(article),
                 })
-                if len(posts) >= 100:
+                if len(posts) >= 80:
                     break
-            if len(posts) >= 100:
+        except Exception as exc:
+            if "closed" in str(exc).lower():
                 break
-            try:
-                page.mouse.wheel(0, 1600)
-                page.wait_for_timeout(900)
-            except Exception:
-                break
-        if len(posts) >= 100:
+            continue
+
+        if len(posts) >= 80:
             break
+
+        # Scroll once for more tweets (don't over-scroll — saves time and avoids close)
+        if X_SEARCH_PAGES > 1:
+            try:
+                page.mouse.wheel(0, 2000)
+                page.wait_for_timeout(1200)
+                articles = page.locator("article[data-testid='tweet']").all()
+                for article in articles:
+                    text = _x_article_text(article)
+                    if not text:
+                        continue
+                    key = re.sub(r"\s+", " ", text).strip()[:240]
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    posts.append({
+                        "text": text,
+                        "public_metrics": _x_article_metrics(article),
+                    })
+                    if len(posts) >= 80:
+                        break
+            except Exception:
+                pass  # scroll failed, that's fine — we have what we have
+
         if _x_login_required(page):
             login_required = True
             break
 
-    page.close()
+    try:
+        page.close()
+    except Exception:
+        pass
 
     if posts:
         _mark_source("x", f"ok: scraped {len(posts)} posts")
     elif login_required:
-        _mark_source("x", "unavailable: login required; set X_AUTH_TOKEN and X_CT0")
+        _mark_source("x", "unavailable: login required; refresh X_AUTH_TOKEN and X_CT0")
     elif empty_reason:
         _mark_source("x", f"unavailable: no posts rendered ({empty_reason})")
     else:
@@ -629,31 +661,32 @@ def _fetch_x_posts_api(tickers: list[str]) -> tuple[list[dict], bool]:
 
 
 def _fetch_x_posts(tickers: list[str]) -> list[dict]:
-    """Fetch X posts via API. If API unavailable, try Playwright as standalone."""
+    """Fetch X posts via Playwright scraping (primary) or API (if available)."""
     selected = tickers[:X_TOP_N]
     if not selected:
         _mark_source("x", "no tickers")
         return []
 
-    # Try X API v2 with Bearer token
-    posts, success = _fetch_x_posts_api(selected)
-    if success:
-        return posts
-
-    # API failed — try Playwright standalone (single browser connection)
+    # Primary path: Playwright scraping via PLAYWRIGHT_CDP_URL
     if PLAYWRIGHT_CDP_URL or PLAYWRIGHT_WS_ENDPOINT:
+        x_search_urls = [_x_search_url(t) for t in selected]
         try:
-            x_search_urls = [_x_search_url(t) for t in selected]
             _, x_posts = _fetch_all_browser_sources([], x_search_urls)
             if x_posts:
-                return posts + x_posts
+                return x_posts
         except Exception as exc:
-            print(f"[sentiment] X Playwright fallback failed: {exc}")
+            print(f"[sentiment] X Playwright scrape failed: {exc}")
 
-    if not posts:
-        if not SOURCE_STATUS.get("x", "").startswith(("ok", "unavailable")):
-            _mark_source("x", "unavailable: API failed, no browser available")
-    return posts
+    # Fallback: X API v2 (if bearer token available)
+    if X_BEARER_TOKEN:
+        posts, success = _fetch_x_posts_api(selected)
+        if success and posts:
+            return posts
+
+    # Nothing worked
+    if not SOURCE_STATUS.get("x", "").startswith("ok"):
+        _mark_source("x", "unavailable: Playwright scrape failed, no API token")
+    return []
 
 
 def _x_search_url(ticker: str) -> str:

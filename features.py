@@ -119,6 +119,19 @@ def add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df["pct_from_52w_high"] = c / c.rolling(252).max() - 1
     df["pct_from_52w_low"]  = c / c.rolling(252).min() - 1
 
+    # ── Mean reversion / z-score signals ──────────────────────────────────────
+    rolling_mean_20 = c.rolling(20).mean()
+    rolling_std_20 = c.rolling(20).std()
+    df["zscore_20"] = (c - rolling_mean_20) / rolling_std_20.replace(0, np.nan)
+    df["zscore_50"] = (c - c.rolling(50).mean()) / c.rolling(50).std().replace(0, np.nan)
+
+    # Volume-weighted price trend (VWAP deviation proxy)
+    typical_price = (h + l + c) / 3
+    cum_tp_vol = (typical_price * v).rolling(20).sum()
+    cum_vol = v.rolling(20).sum()
+    vwap_20 = cum_tp_vol / cum_vol.replace(0, np.nan)
+    df["vwap_deviation"] = c / vwap_20 - 1
+
     # ── Candlestick patterns (simple) ─────────────────────────────────────────
     df["body"]       = (df["close"] - df["open"]).abs()
     df["upper_wick"] = df["high"] - df[["close","open"]].max(axis=1)
@@ -218,6 +231,7 @@ FEATURE_COLS = [
     "price_vs_ema50","price_vs_ema200",
     "ema_cross_9_21","ema_cross_50_200",
     "pct_from_52w_high","pct_from_52w_low",
+    "zscore_20","zscore_50","vwap_deviation",
     "volume_ratio","obv","mfi",
     "body","upper_wick","lower_wick","is_bullish",
     "benchmark_ret_5","benchmark_ret_20","benchmark_volatility_20d",

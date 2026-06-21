@@ -450,39 +450,105 @@ def _fetch_reddit_bulk_with_playwright(
 
 
 def _fetch_reddit_posts() -> list[dict]:
-    headers = _reddit_headers()
+    """Fetch Reddit posts using multiple strategies in priority order:
+    1. Direct JSON (works from some IPs)
+    2. RSS feeds (no auth needed, works from most IPs)
+    3. Remote browser via Playwright (last resort)
+    """
     subreddits = _reddit_subreddit_names()
     if not subreddits:
         _mark_source("reddit", "not configured")
         return []
 
-    # Try direct JSON fetch first for one listing to test connectivity
+    # Strategy 1: Try direct JSON fetch
+    headers = _reddit_headers()
     test_rows, test_error = _fetch_reddit_listing(subreddits[0], "hot", headers)
-    direct_works = bool(test_rows)
 
-    if direct_works:
-        # Direct fetch works — use it for everything (local or unblocked IP)
+    if test_rows:
+        # Direct JSON works — use it for everything
         posts = list(test_rows)
         for subreddit in subreddits:
             for listing in REDDIT_LISTINGS:
                 if subreddit == subreddits[0] and listing == "hot":
-                    continue  # already fetched
+                    continue
                 params = None if listing == "hot" else {"limit": 75}
                 if listing == "top" and params is not None:
                     params["t"] = REDDIT_TOP_TIME_FILTER
-                rows, error = _fetch_reddit_listing(subreddit, listing, headers, params)
+                rows, _ = _fetch_reddit_listing(subreddit, listing, headers, params)
                 posts.extend(rows)
                 time.sleep(0.05)
         deduped = _dedupe_posts(posts)
         if deduped:
-            _mark_source("reddit", f"ok: fetched {len(deduped)} posts")
-        else:
-            _mark_source("reddit", "unavailable: no posts returned")
-        return deduped
-    else:
-        # Direct blocked — signal that we need browser fallback
-        # Return None to indicate caller should use shared browser session
-        return None  # type: ignore
+            _mark_source("reddit", f"ok: fetched {len(deduped)} posts via JSON")
+            return deduped
+
+    # Strategy 2: RSS feeds (works from most IPs, no auth needed)
+    rss_posts = _fetch_reddit_rss(subreddits)
+    if rss_posts:
+        _mark_source("reddit", f"ok: fetched {len(rss_posts)} posts via RSS")
+        return rss_posts
+
+    # Strategy 3: Signal that browser fallback is needed
+    # Return None so build_sentiment_overlay uses the shared browser session
+    return None  # type: ignore
+
+
+def _fetch_reddit_rss(subreddits: list[str]) -> list[dict]:
+    """Fetch Reddit posts via RSS feeds. No auth, no browser needed."""
+    posts = []
+    for subreddit in subreddits:
+        for listing in REDDIT_LISTINGS:
+            if listing == "hot":
+                url = f"https://www.reddit.com/r/{subreddit}/.rss"
+            elif listing == "top":
+                url = f"https://www.reddit.com/r/{subreddit}/top/.rss?t={REDDIT_TOP_TIME_FILTER}"
+            else:
+                url = f"https://www.reddit.com/r/{subreddit}/{listing}/.rss"
+
+            try:
+                resp = requests.get(
+                    url,
+                    headers={
+                        "User-Agent": REDDIT_USER_AGENT,
+                        "Accept": "application/rss+xml,application/xml,text/xml,*/*",
+                    },
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if resp.status_code == 403:
+                    continue
+                if resp.status_code == 429:
+                    # Rate limited — wait and try next subreddit
+                    time.sleep(2.0)
+                    continue
+                resp.raise_for_status()
+
+                root = ET.fromstring(resp.content)
+                # Atom feed namespace
+                ns = {"atom": "http://www.w3.org/2005/Atom"}
+
+                for entry in root.findall(".//atom:entry", ns):
+                    title = entry.findtext("atom:title", default="", namespaces=ns)
+                    content = entry.findtext("atom:content", default="", namespaces=ns)
+                    # Strip HTML from content
+                    clean_content = re.sub(r"<[^>]+>", " ", content)
+                    # Extract subreddit from category
+                    category = entry.find("atom:category", ns)
+                    sub = category.get("label", subreddit) if category is not None else subreddit
+
+                    posts.append({
+                        "title": title,
+                        "selftext": clean_content[:2000],
+                        "subreddit": sub,
+                        "num_comments": 0,
+                        "score": 0,
+                    })
+            except Exception as exc:
+                print(f"[sentiment] Reddit RSS r/{subreddit}/{listing} failed: {exc}")
+                continue
+            # Delay between requests to avoid rate limiting
+            time.sleep(1.0)
+
+    return _dedupe_posts(posts) if posts else []
 
 
 def _build_reddit_browser_requests() -> list[tuple[str, str, dict | None]]:
@@ -502,7 +568,7 @@ def _fetch_x_posts_api(tickers: list[str]) -> tuple[list[dict], bool]:
     """
     Fetch recent X/Twitter posts using the v2 API with Bearer token.
     Returns (posts, success). If the API call fails or token is missing,
-    returns ([], False) so the caller can fall back to Playwright scraping.
+    returns ([], False) so the caller can fall back to other methods.
     """
     if not X_BEARER_TOKEN:
         return [], False
@@ -531,12 +597,18 @@ def _fetch_x_posts_api(tickers: list[str]) -> tuple[list[dict], bool]:
                 params=params,
                 timeout=REQUEST_TIMEOUT,
             )
-            if resp.status_code == 401 or resp.status_code == 403:
-                print(f"[sentiment] X API auth failed ({resp.status_code}); falling back to scrape")
-                return [], False
+            if resp.status_code == 401:
+                print(f"[sentiment] X API 401: bearer token invalid")
+                _mark_source("x", "unavailable: X_BEARER_TOKEN is invalid (401)")
+                return posts, bool(posts)
+            if resp.status_code == 403:
+                print(f"[sentiment] X API 403: insufficient permissions (need Basic tier+)")
+                _mark_source("x", "unavailable: X API 403; upgrade to Basic tier for search")
+                return posts, bool(posts)
             if resp.status_code == 429:
-                print(f"[sentiment] X API rate limited; falling back to scrape")
-                return posts, False  # return what we have so far
+                print(f"[sentiment] X API rate limited")
+                _mark_source("x", f"ok: fetched {len(posts)} posts via API (rate limited)")
+                return posts, bool(posts)
             resp.raise_for_status()
             data = resp.json()
             for tweet in data.get("data", []):
@@ -549,7 +621,7 @@ def _fetch_x_posts_api(tickers: list[str]) -> tuple[list[dict], bool]:
             if not posts:
                 return [], False
             break
-        time.sleep(0.1)
+        time.sleep(0.2)
 
     if posts:
         _mark_source("x", f"ok: fetched {len(posts)} posts via API")
@@ -557,28 +629,31 @@ def _fetch_x_posts_api(tickers: list[str]) -> tuple[list[dict], bool]:
 
 
 def _fetch_x_posts(tickers: list[str]) -> list[dict]:
-    """Standalone X fetch — used when Reddit works via direct HTTP.
-    When Reddit needs browser, use _fetch_all_browser_sources instead."""
+    """Fetch X posts via API. If API unavailable, try Playwright as standalone."""
     selected = tickers[:X_TOP_N]
     if not selected:
         _mark_source("x", "no tickers")
         return []
 
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as exc:
-        _mark_source("x", f"unavailable: Playwright import failed: {exc}")
-        return []
+    # Try X API v2 with Bearer token
+    posts, success = _fetch_x_posts_api(selected)
+    if success:
+        return posts
 
-    search_urls = [_x_search_url(ticker) for ticker in selected]
+    # API failed — try Playwright standalone (single browser connection)
+    if PLAYWRIGHT_CDP_URL or PLAYWRIGHT_WS_ENDPOINT:
+        try:
+            x_search_urls = [_x_search_url(t) for t in selected]
+            _, x_posts = _fetch_all_browser_sources([], x_search_urls)
+            if x_posts:
+                return posts + x_posts
+        except Exception as exc:
+            print(f"[sentiment] X Playwright fallback failed: {exc}")
 
-    try:
-        # Open single browser just for X
-        reddit_posts_unused, x_posts = _fetch_all_browser_sources([], search_urls)
-        return x_posts
-    except Exception as exc:
-        _mark_source("x", f"unavailable: scrape failed: {exc}")
-        return []
+    if not posts:
+        if not SOURCE_STATUS.get("x", "").startswith(("ok", "unavailable")):
+            _mark_source("x", "unavailable: API failed, no browser available")
+    return posts
 
 
 def _x_search_url(ticker: str) -> str:
@@ -882,21 +957,21 @@ def build_sentiment_overlay(
 
     # Determine if we need a browser session (Reddit blocked from this IP)
     reddit_posts = _fetch_reddit_posts()
-    needs_browser = reddit_posts is None  # None means direct fetch blocked
+    needs_browser = reddit_posts is None  # None means all non-browser strategies failed
 
     ranked_tickers = (
         scored_df.sort_values("prob_buy", ascending=False)["ticker"]
         .head(max(X_TOP_N, NEWS_TOP_N))
         .tolist()
     )
-    x_search_urls = [_x_search_url(t) for t in ranked_tickers[:X_TOP_N]]
 
     if needs_browser:
-        # Use ONE shared browser connection for both Reddit and X
+        # All Reddit strategies failed — use shared browser for Reddit + X
         reddit_requests = _build_reddit_browser_requests()
+        x_search_urls = [_x_search_url(t) for t in ranked_tickers[:X_TOP_N]]
         reddit_posts, x_posts = _fetch_all_browser_sources(reddit_requests, x_search_urls)
     else:
-        # Reddit worked via direct HTTP; open browser only for X
+        # Reddit worked without browser — use X API independently
         x_posts = _fetch_x_posts(ranked_tickers)
 
     for post in (reddit_posts or []):

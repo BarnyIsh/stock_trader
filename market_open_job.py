@@ -301,13 +301,15 @@ def run_market_open_job(send_email: bool = True) -> dict:
     now_ny = datetime.now(ZoneInfo("America/New_York"))
     bundle = _load_model_bundle()
 
-    # Score the full market universe, not just training tickers.
-    # The model learns general technical patterns that apply to any stock.
-    from market_research import get_full_universe
-    universe = get_full_universe()
-    # Ensure training tickers are included too
+    # On Vercel, use training tickers (126 stocks) to stay within function timeout.
+    # Locally, score the full universe.
     training_tickers = bundle["metadata"]["tickers"]
-    tickers = list(dict.fromkeys(universe + training_tickers))
+    if os.getenv("VERCEL"):
+        tickers = training_tickers
+    else:
+        from market_research import get_full_universe
+        universe = get_full_universe()
+        tickers = list(dict.fromkeys(universe + training_tickers))
 
     base_scored_df = score_today(tickers, model_bundle=bundle)
     if base_scored_df.empty:

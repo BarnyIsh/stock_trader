@@ -443,80 +443,97 @@ def score_today(
 
     import yfinance as yf
 
-    # Use only last 6 months of data for scoring (enough for all indicators)
+    # Use only last 10 months of data for scoring (enough for all indicators)
     from datetime import datetime, timedelta
     score_start = (datetime.today() - timedelta(days=300)).strftime("%Y-%m-%d")
     score_end = datetime.today().strftime("%Y-%m-%d")
 
-    # Batch download — much faster than per-ticker
-    print(f"  Batch downloading {len(tickers)} tickers...")
-    batch_data = yf.download(
-        tickers, start=score_start, end=score_end,
-        auto_adjust=True, progress=False, group_by="ticker", threads=True,
-    )
+    # Batch download in chunks to avoid timeouts on serverless
+    chunk_size = 40
+    all_frames = []
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i:i + chunk_size]
+        try:
+            data = yf.download(
+                chunk, start=score_start, end=score_end,
+                auto_adjust=True, progress=False, group_by="ticker", threads=True,
+            )
+            if not data.empty:
+                all_frames.append((chunk, data))
+        except Exception as exc:
+            print(f"  [warn] Chunk {i}-{i+len(chunk)} download failed: {exc}")
+
+    if not all_frames:
+        print("  [error] No price data downloaded.")
+        return pd.DataFrame()
 
     benchmark_df = build_benchmark_features(score_start, score_end)
 
     rows = []
-    for ticker in tickers:
-        try:
-            # Extract single ticker from batch
-            if len(tickers) == 1:
-                df = batch_data.copy()
-            elif isinstance(batch_data.columns, pd.MultiIndex):
-                if ticker not in batch_data.columns.get_level_values(0):
+    for chunk_tickers, batch_data in all_frames:
+        for ticker in chunk_tickers:
+            try:
+                # Extract single ticker from batch
+                if isinstance(batch_data.columns, pd.MultiIndex):
+                    if ticker not in batch_data.columns.get_level_values(0):
+                        continue
+                    df = batch_data[ticker].copy()
+                else:
+                    # Non-multi-index (shouldn't happen with group_by='ticker')
+                    df = batch_data.copy()
+
+                if df.empty:
                     continue
-                df = batch_data[ticker].copy()
-            else:
-                continue
+                df.columns = [c.lower() for c in df.columns]
+                df = df[["open", "high", "low", "close", "volume"]].dropna()
+                if len(df) < 60:
+                    continue
 
-            if df.empty:
-                continue
-            df.columns = [c.lower() for c in df.columns]
-            df = df[["open", "high", "low", "close", "volume"]].dropna()
-            if len(df) < 60:
-                continue
+                df = add_technical_features(df)
+                if not benchmark_df.empty:
+                    df = df.join(benchmark_df, how="left")
+                    df["relative_roc_5"] = df["roc_5"] - df["benchmark_ret_5"]
+                    df["relative_roc_20"] = df["roc_20"] - df["benchmark_ret_20"]
 
-            df = add_technical_features(df)
-            if not benchmark_df.empty:
-                df = df.join(benchmark_df, how="left")
-                df["relative_roc_5"] = df["roc_5"] - df["benchmark_ret_5"]
-                df["relative_roc_20"] = df["roc_20"] - df["benchmark_ret_20"]
+                # Handle feature cols that may not exist in older models
+                available_features = [c for c in feature_cols if c in df.columns]
+                if len(available_features) < len(feature_cols) * 0.8:
+                    continue
 
-            # Handle feature cols that may not exist in older models
-            available_features = [c for c in feature_cols if c in df.columns]
-            if len(available_features) < len(feature_cols) * 0.8:
-                continue
-            df = df.dropna(subset=available_features)
-            if df.empty:
-                continue
+                # Drop rows where core features are NaN (warm-up period)
+                # but don't require ALL features — some (52-week) need more history
+                core_features = [c for c in available_features
+                                 if not c.startswith("pct_from_52w")]
+                df = df.dropna(subset=core_features)
+                if df.empty:
+                    continue
 
-            last = df.iloc[[-1]][available_features].fillna(0)
-            # Pad missing features with 0
-            for col in feature_cols:
-                if col not in last.columns:
-                    last[col] = 0.0
-            last = last[feature_cols]
+                last = df.iloc[[-1]][available_features].fillna(0)
+                # Pad missing features with 0
+                for col in feature_cols:
+                    if col not in last.columns:
+                        last[col] = 0.0
+                last = last[feature_cols]
 
-            p_rf = rf.predict_proba(last)[0, 1]
-            p_gb = gb.predict_proba(last)[0, 1]
-            p_lr = lr.predict_proba(last)[0, 1]
-            prob = 0.40 * p_rf + 0.40 * p_gb + 0.20 * p_lr
-            rows.append({
-                "ticker":    ticker,
-                "date":      df.index[-1],
-                "price":     float(df["close"].iloc[-1]),
-                "prob_buy":  float(prob),
-                "prob_rf":   float(p_rf),
-                "prob_gb":   float(p_gb),
-                "prob_lr":   float(p_lr),
-                "rsi":       float(df["rsi"].iloc[-1]) if "rsi" in df.columns else 50.0,
-                "bb_pct":    float(df["bb_pct"].iloc[-1]) if "bb_pct" in df.columns else 0.5,
-                "macd_hist": float(df["macd_hist"].iloc[-1]) if "macd_hist" in df.columns else 0.0,
-                "roc_5":     float(df["roc_5"].iloc[-1]) if "roc_5" in df.columns else 0.0,
-            })
-        except Exception as e:
-            pass  # skip silently for large universes
+                p_rf = rf.predict_proba(last)[0, 1]
+                p_gb = gb.predict_proba(last)[0, 1]
+                p_lr = lr.predict_proba(last)[0, 1]
+                prob = 0.40 * p_rf + 0.40 * p_gb + 0.20 * p_lr
+                rows.append({
+                    "ticker":    ticker,
+                    "date":      df.index[-1],
+                    "price":     float(df["close"].iloc[-1]),
+                    "prob_buy":  float(prob),
+                    "prob_rf":   float(p_rf),
+                    "prob_gb":   float(p_gb),
+                    "prob_lr":   float(p_lr),
+                    "rsi":       float(df["rsi"].iloc[-1]) if "rsi" in df.columns else 50.0,
+                    "bb_pct":    float(df["bb_pct"].iloc[-1]) if "bb_pct" in df.columns else 0.5,
+                    "macd_hist": float(df["macd_hist"].iloc[-1]) if "macd_hist" in df.columns else 0.0,
+                    "roc_5":     float(df["roc_5"].iloc[-1]) if "roc_5" in df.columns else 0.0,
+                })
+            except Exception:
+                pass  # skip silently for large universes
 
     if not rows:
         return pd.DataFrame()

@@ -475,39 +475,29 @@ def _fetch_x_posts(tickers: list[str]) -> list[dict]:
         _mark_source("x", "no tickers")
         return []
 
-    # Primary path: X API v2 with Bearer token
-    api_posts, api_ok = _fetch_x_posts_api(selected)
-    if api_ok:
-        return api_posts
-
-    # If API failed and we have auth cookies + a remote browser, try scraping
-    # But ONLY if we have both cookies AND a CDP endpoint — otherwise skip
-    if not (X_AUTH_TOKEN and X_CT0 and (PLAYWRIGHT_CDP_URL or PLAYWRIGHT_WS_ENDPOINT)):
-        if api_posts:
-            _mark_source("x", f"partial: got {len(api_posts)} posts from API before failure")
-        else:
-            _mark_source("x", "unavailable: API auth failed; set valid X_BEARER_TOKEN")
-        return api_posts
-
-    # Playwright scraping fallback (uses remote browser)
+    # Primary path: Playwright scraping via remote browser (or local)
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
         from playwright.sync_api import sync_playwright
     except Exception as exc:
-        _mark_source("x", f"unavailable: API failed, Playwright import failed: {exc}")
-        return api_posts
+        _mark_source("x", f"unavailable: Playwright import failed: {exc}")
+        print(f"[sentiment] X scrape skipped; Playwright import failed: {exc}")
+        return []
 
     search_urls = [_x_search_url(ticker) for ticker in selected]
 
     try:
-        scraped = _scrape_x_with_playwright(sync_playwright, PlaywrightTimeoutError, search_urls)
-        return api_posts + scraped
+        return _scrape_x_with_playwright(sync_playwright, PlaywrightTimeoutError, search_urls)
     except Exception as exc:
         if _playwright_system_lib_missing(exc):
-            _mark_source("x", "unavailable: API failed, local Chromium missing libs")
+            _mark_source(
+                "x",
+                "unavailable: local Chromium missing Linux libs; set PLAYWRIGHT_CDP_URL",
+            )
         else:
-            _mark_source("x", f"unavailable: API failed, scrape failed: {exc}")
-        return api_posts
+            _mark_source("x", f"unavailable: scrape failed: {exc}")
+        print(f"[sentiment] X scrape failed: {exc}")
+        return []
 
 
 def _x_search_url(ticker: str) -> str:

@@ -31,7 +31,39 @@ LOG_DIR = (
     else Path(__file__).parent / "logs"
 )
 LOG_DIR.mkdir(exist_ok=True)
-DEFAULT_EMAIL_TO = "bryan.g.shi@gmail.com"
+
+# Subscription-based email list.
+# EMAIL_SUBSCRIBERS is a comma-separated list of email addresses.
+# Falls back to EMAIL_TO for backward compat, then to the default.
+DEFAULT_SUBSCRIBERS = "bryan.g.shi@gmail.com"
+
+
+def _get_subscribers() -> list[str]:
+    """Return deduplicated list of subscriber email addresses."""
+    # Check runtime cache first (updated via /api/subscribers)
+    cache_file = Path("/tmp/stock_trader_subscribers.json")
+    if cache_file.exists():
+        try:
+            data = json.loads(cache_file.read_text())
+            if isinstance(data, list) and data:
+                return data
+        except Exception:
+            pass
+
+    raw = os.getenv("EMAIL_SUBSCRIBERS", "").strip()
+    if not raw:
+        # Backward compat: fall back to EMAIL_TO if EMAIL_SUBSCRIBERS not set
+        raw = os.getenv("EMAIL_TO", DEFAULT_SUBSCRIBERS).strip()
+    addresses = [addr.strip() for addr in raw.split(",") if addr.strip()]
+    # Deduplicate while preserving order
+    seen = set()
+    result = []
+    for addr in addresses:
+        lower = addr.lower()
+        if lower not in seen:
+            seen.add(lower)
+            result.append(addr)
+    return result
 
 
 def _load_model_bundle() -> dict:
@@ -240,18 +272,21 @@ def _send_email(subject: str, body: str, html_body: str | None = None):
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
     smtp_user = os.getenv("SMTP_USER", "").strip()
     smtp_password = os.getenv("SMTP_PASSWORD", "").strip()
-    email_to = os.getenv("EMAIL_TO", DEFAULT_EMAIL_TO).strip()
-    email_from = os.getenv("EMAIL_FROM", smtp_user or email_to).strip()
+    subscribers = _get_subscribers()
+    email_from = os.getenv("EMAIL_FROM", smtp_user or subscribers[0]).strip()
 
     if not smtp_host or not smtp_user or not smtp_password:
         raise RuntimeError(
             "Missing SMTP_HOST, SMTP_USER, or SMTP_PASSWORD environment variables."
         )
 
+    if not subscribers:
+        raise RuntimeError("No email subscribers configured.")
+
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = email_from
-    msg["To"] = email_to
+    msg["To"] = ", ".join(subscribers)
     msg.set_content(body)
     if html_body:
         msg.add_alternative(html_body, subtype="html")
@@ -368,6 +403,7 @@ def run_market_open_job(send_email: bool = True) -> dict:
         "ok": True,
         "date": now_ny.isoformat(),
         "email_sent": send_email,
+        "subscribers": _get_subscribers() if send_email else [],
         "trade_count": len(trade_rows),
         "buy_count": sum(1 for row in trade_rows if row["action"] == "BUY"),
         "sell_count": sum(1 for row in trade_rows if row["action"] == "SELL"),

@@ -51,13 +51,36 @@ SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USER=<your sending email>
 SMTP_PASSWORD=<your app password>
-EMAIL_TO=bryan.g.shi@gmail.com
+EMAIL_SUBSCRIBERS=bryan.g.shi@gmail.com
 EMAIL_FROM=<your sending email>
 CRON_SECRET=<random long secret>
 ```
 
 For Gmail, `SMTP_PASSWORD` should be an app password, not your normal account
 password.
+
+### Email Subscribers
+
+The system supports multiple subscribers. Set `EMAIL_SUBSCRIBERS` to a
+comma-separated list of email addresses:
+
+```text
+EMAIL_SUBSCRIBERS=bryan.g.shi@gmail.com,friend@example.com,colleague@example.com
+```
+
+For backward compatibility, if `EMAIL_SUBSCRIBERS` is not set, the system
+falls back to `EMAIL_TO`, then to `bryan.g.shi@gmail.com`.
+
+You can also manage subscribers at runtime via the API:
+
+```text
+GET  /api/subscribers                    → list subscribers
+POST /api/subscribers?email=new@test.com → add subscriber (requires CRON_SECRET)
+DELETE /api/subscribers?email=old@test.com → remove subscriber (requires CRON_SECRET)
+```
+
+Note: Runtime subscriber changes persist in `/tmp` which resets on cold starts.
+For permanent changes, update `EMAIL_SUBSCRIBERS` in Vercel env vars.
 
 ## Optional Sentiment Overlay Variables
 
@@ -74,37 +97,52 @@ REDDIT_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
 REDDIT_COOKIE=<optional reddit browser Cookie header>
 X_TOP_N=12
 X_SEARCH_PAGES=2
-X_AUTH_TOKEN=<optional x auth_token cookie>
-X_CT0=<optional x ct0 cookie>
-PLAYWRIGHT_CDP_URL=<optional browserless/browserbase cdp websocket url>
+X_BEARER_TOKEN=<X/Twitter API v2 Bearer token - primary method>
+X_AUTH_TOKEN=<optional x auth_token cookie - fallback for Playwright scrape>
+X_CT0=<optional x ct0 cookie - fallback for Playwright scrape>
+PLAYWRIGHT_CDP_URL=<browserless/browserbase cdp websocket url>
 PLAYWRIGHT_WS_ENDPOINT=<optional playwright websocket endpoint>
 X_RUNTIME_BROWSER_INSTALL=false
 SENTIMENT_REQUEST_TIMEOUT=6
 ```
 
-`prob_buy` in the email is the adjusted score. `base_prob_buy` is the original
-ML score before the overlay. Reddit is fetched from public subreddit JSON
-endpoints such as `https://www.reddit.com/r/stocks.json`; no Reddit API
-credentials are required. X is scraped with Playwright from search pages, so no
-X API key is required. X may
-redirect anonymous headless browsers to login; if that happens, set the
-optional `X_AUTH_TOKEN` and `X_CT0` cookie values from a browser session.
-Playwright needs a browser binary such as Chromium. Vercel's Python runtime can
-bundle the browser with extended function limits, but the runtime still lacks
-some shared Linux libraries needed to launch it. The reliable Vercel setup is a
-remote browser service. Set `PLAYWRIGHT_CDP_URL` for a Chrome DevTools Protocol
-endpoint, or `PLAYWRIGHT_WS_ENDPOINT` for a Playwright protocol endpoint. The X
-scraper still uses Playwright; it just connects to a browser running outside
-Vercel.
+### X/Twitter Data Source
 
-Reddit is fetched from public JSON endpoints. These URLs may open in your
-browser but still return 403 from Vercel because Reddit blocks some server IPs.
-When a remote browser endpoint is configured, Reddit JSON fetches that are
-blocked from Vercel are retried through the same remote browser. If Reddit still
-returns a login/block page, set `REDDIT_COOKIE` to the full `Cookie` request
-header copied from a logged-in browser request to `https://www.reddit.com/r/stocks.json`.
-Facebook/Meta public post search is not included by default because useful
-public content access requires approved Meta Graph API permissions.
+The system uses a two-tier approach for X data:
+
+1. **Primary: X API v2** — Uses `X_BEARER_TOKEN` to call the Twitter/X recent
+   search API. This is fast, reliable, and works on Vercel without Playwright.
+   Get a bearer token from the [X Developer Portal](https://developer.x.com).
+
+2. **Fallback: Playwright scraping** — If the API fails (auth error, rate limit),
+   falls back to scraping X search pages via a remote browser. Requires
+   `PLAYWRIGHT_CDP_URL` and optionally `X_AUTH_TOKEN` + `X_CT0` cookies.
+
+### Reddit Data Source
+
+Reddit JSON endpoints (`/r/stocks.json`) work locally but are blocked from
+Vercel server IPs. The system handles this automatically:
+
+1. **Direct fetch** — Tries the public JSON endpoint first (works locally).
+2. **Remote browser fallback** — When the direct fetch fails (403 on Vercel),
+   automatically retries through the remote browser at `PLAYWRIGHT_CDP_URL`.
+   The remote browser fetches the JSON endpoint from a residential/cloud IP
+   that Reddit doesn't block.
+
+If Reddit still returns a login/block page through the remote browser, set
+`REDDIT_COOKIE` to the full `Cookie` request header copied from a logged-in
+browser request to `https://www.reddit.com/r/stocks.json`.
+
+### Remote Browser (Browserless)
+
+Both Reddit fallback and X Playwright scraping use the same remote browser
+endpoint. Set `PLAYWRIGHT_CDP_URL` to your Browserless WebSocket URL:
+
+```text
+PLAYWRIGHT_CDP_URL=wss://chrome.browserless.io?token=YOUR_TOKEN
+```
+
+This single endpoint handles both data sources on Vercel.
 
 ## Optional Portfolio State
 
@@ -140,6 +178,7 @@ to a JSON object with the same shape as `.portfolio_state.json`, for example:
 Deploy from the `stock_trader` directory so Vercel sees:
 
 - `api/market_open.py`
+- `api/subscribers.py`
 - `vercel.json`
 - `requirements.txt`
 - `models/rf_latest.pkl`

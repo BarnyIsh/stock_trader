@@ -46,6 +46,7 @@ X_TOP_N = int(os.getenv("X_TOP_N", "12"))
 X_SEARCH_PAGES = int(os.getenv("X_SEARCH_PAGES", "2"))
 X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "").strip()
 X_CT0 = os.getenv("X_CT0", "").strip()
+X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
 X_RUNTIME_BROWSER_INSTALL = os.getenv("X_RUNTIME_BROWSER_INSTALL", "false").lower() == "true"
 PLAYWRIGHT_CDP_URL = os.getenv("PLAYWRIGHT_CDP_URL", "").strip()
 PLAYWRIGHT_WS_ENDPOINT = os.getenv("PLAYWRIGHT_WS_ENDPOINT", "").strip()
@@ -193,6 +194,7 @@ def _fetch_reddit_listing(
     headers: dict,
     params: dict | None = None,
 ) -> tuple[list[dict], str | None]:
+    """Fetch Reddit JSON listing via direct HTTP request."""
     if listing == "hot":
         url = f"https://www.reddit.com/r/{subreddit}.json"
     else:
@@ -205,8 +207,13 @@ def _fetch_reddit_listing(
             headers=headers,
             timeout=REQUEST_TIMEOUT,
         )
+        if resp.status_code == 403:
+            return [], f"r/{subreddit} {listing}: 403 blocked"
         resp.raise_for_status()
-        children = resp.json().get("data", {}).get("children", [])
+        data = resp.json()
+        children = data.get("data", {}).get("children", [])
+        if not children:
+            return [], f"r/{subreddit} {listing}: empty response"
         rows = []
         for child in children:
             post = child.get("data", {}) or {}
@@ -224,8 +231,7 @@ def _fetch_reddit_listing_with_playwright(
     listing: str,
     params: dict | None = None,
 ) -> tuple[list[dict], str | None]:
-    if not (PLAYWRIGHT_CDP_URL or PLAYWRIGHT_WS_ENDPOINT):
-        return [], "remote browser not configured"
+    """Fetch Reddit JSON listing via a Playwright browser (remote or local)."""
 
     if listing == "hot":
         url = f"https://www.reddit.com/r/{subreddit}.json"
@@ -249,17 +255,44 @@ def _fetch_reddit_listing_with_playwright(
             )
             _add_cookie_header_cookies(context, REDDIT_COOKIE, ".reddit.com")
             page = context.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=int(REQUEST_TIMEOUT * 1000))
-            text = page.locator("body").inner_text(timeout=int(REQUEST_TIMEOUT * 1000)).strip()
-            browser.close()
 
-        if text.startswith("{"):
-            payload = json.loads(text)
-        else:
-            match = re.search(r"({.*})", text, flags=re.DOTALL)
-            if not match:
-                return [], f"remote browser returned non-json content from {url}"
-            payload = json.loads(match.group(1))
+            # Use route to intercept and get JSON response directly
+            json_response = {}
+
+            def handle_response(response):
+                nonlocal json_response
+                if response.url.startswith(url.split("?")[0]) and response.status == 200:
+                    try:
+                        json_response = response.json()
+                    except Exception:
+                        pass
+
+            page.on("response", handle_response)
+            page.goto(url, wait_until="networkidle", timeout=int(REQUEST_TIMEOUT * 2000))
+
+            # If we caught the response via event listener, use it
+            if json_response and "data" in json_response:
+                payload = json_response
+            else:
+                # Fall back to reading body text
+                text = page.locator("body").inner_text(timeout=int(REQUEST_TIMEOUT * 1000)).strip()
+                # Try to find JSON in potentially wrapped content
+                if text.startswith("{"):
+                    payload = json.loads(text)
+                else:
+                    # Some pages wrap JSON in <pre> or other elements
+                    pre = page.locator("pre").first
+                    try:
+                        pre_text = pre.inner_text(timeout=2000).strip()
+                        payload = json.loads(pre_text)
+                    except Exception:
+                        match = re.search(r"(\{\"kind\".*\})\s*$", text, flags=re.DOTALL)
+                        if not match:
+                            browser.close()
+                            return [], f"remote browser returned non-json from r/{subreddit}/{listing}"
+                        payload = json.loads(match.group(1))
+
+            browser.close()
 
         rows = []
         children = payload.get("data", {}).get("children", [])
@@ -283,27 +316,41 @@ def _fetch_reddit_posts() -> list[dict]:
         _mark_source("reddit", "not configured")
         return []
 
+    # Track whether direct JSON fetches are working (they fail on Vercel IPs)
+    direct_blocked = False
+
     for subreddit in subreddits:
         for listing in REDDIT_LISTINGS:
             params = None if listing == "hot" else {"limit": 75}
             if listing == "top" and params is not None:
                 params["t"] = REDDIT_TOP_TIME_FILTER
-            rows, error = _fetch_reddit_listing(subreddit, listing, headers, params)
-            posts.extend(rows)
-            if error:
-                errors.append(error)
-                browser_rows, browser_error = _fetch_reddit_listing_with_playwright(
-                    subreddit, listing, params
-                )
-                browser_posts.extend(browser_rows)
-                if browser_error:
-                    browser_errors.append(f"r/{subreddit} {listing}: {browser_error}")
+
+            # Try direct JSON fetch first (works locally, often blocked on Vercel)
+            if not direct_blocked:
+                rows, error = _fetch_reddit_listing(subreddit, listing, headers, params)
+                if rows:
+                    posts.extend(rows)
+                    time.sleep(0.05)
+                    continue
+                if error:
+                    errors.append(error)
+                    direct_blocked = True  # skip direct for remaining subreddits
+
+            # Fall back to remote browser
+            browser_rows, browser_error = _fetch_reddit_listing_with_playwright(
+                subreddit, listing, params
+            )
+            browser_posts.extend(browser_rows)
+            if browser_error:
+                browser_errors.append(f"r/{subreddit} {listing}: {browser_error}")
             time.sleep(0.05)
 
     deduped = _dedupe_posts(posts + browser_posts)
     if deduped:
-        if browser_posts:
+        if browser_posts and not posts:
             _mark_source("reddit", f"ok: fetched {len(deduped)} posts via remote browser")
+        elif browser_posts:
+            _mark_source("reddit", f"ok: fetched {len(deduped)} posts (direct + remote browser)")
         else:
             _mark_source("reddit", f"ok: fetched {len(deduped)} posts")
     else:
@@ -315,24 +362,89 @@ def _fetch_reddit_posts() -> list[dict]:
     return deduped
 
 
+def _fetch_x_posts_api(tickers: list[str]) -> tuple[list[dict], bool]:
+    """
+    Fetch recent X/Twitter posts using the v2 API with Bearer token.
+    Returns (posts, success). If the API call fails or token is missing,
+    returns ([], False) so the caller can fall back to Playwright scraping.
+    """
+    if not X_BEARER_TOKEN:
+        return [], False
+
+    selected = tickers[:X_TOP_N]
+    if not selected:
+        return [], True
+
+    headers = {
+        "Authorization": f"Bearer {X_BEARER_TOKEN}",
+        "User-Agent": "StockTrader/1.0",
+    }
+    posts: list[dict] = []
+
+    for ticker in selected:
+        query = f"${ticker} (stock OR earnings OR shares OR market) lang:en -is:retweet"
+        params = {
+            "query": query,
+            "max_results": 10,
+            "tweet.fields": "public_metrics,text,created_at",
+        }
+        try:
+            resp = requests.get(
+                "https://api.x.com/2/tweets/search/recent",
+                headers=headers,
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if resp.status_code == 401 or resp.status_code == 403:
+                print(f"[sentiment] X API auth failed ({resp.status_code}); falling back to scrape")
+                return [], False
+            if resp.status_code == 429:
+                print(f"[sentiment] X API rate limited; falling back to scrape")
+                return posts, False  # return what we have so far
+            resp.raise_for_status()
+            data = resp.json()
+            for tweet in data.get("data", []):
+                posts.append({
+                    "text": tweet.get("text", ""),
+                    "public_metrics": tweet.get("public_metrics", {}),
+                })
+        except Exception as exc:
+            print(f"[sentiment] X API error for ${ticker}: {exc}")
+            if not posts:
+                return [], False
+            break
+        time.sleep(0.1)
+
+    if posts:
+        _mark_source("x", f"ok: fetched {len(posts)} posts via API")
+    return posts, True
+
+
 def _fetch_x_posts(tickers: list[str]) -> list[dict]:
     selected = tickers[:X_TOP_N]
     if not selected:
         _mark_source("x", "no tickers")
         return []
 
+    # Primary path: X API v2 with Bearer token
+    api_posts, api_ok = _fetch_x_posts_api(selected)
+    if api_ok:
+        return api_posts
+
+    # Fallback: Playwright scraping
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
         from playwright.sync_api import sync_playwright
     except Exception as exc:
         _mark_source("x", f"unavailable: Playwright import failed: {exc}")
         print(f"[sentiment] X scrape skipped; Playwright import failed: {exc}")
-        return []
+        return api_posts  # return whatever the API got before failing
 
     search_urls = [_x_search_url(ticker) for ticker in selected]
 
     try:
-        return _scrape_x_with_playwright(sync_playwright, PlaywrightTimeoutError, search_urls)
+        scraped = _scrape_x_with_playwright(sync_playwright, PlaywrightTimeoutError, search_urls)
+        return api_posts + scraped
     except Exception as exc:
         if "Executable doesn't exist" not in str(exc):
             if _playwright_system_lib_missing(exc):
@@ -341,27 +453,28 @@ def _fetch_x_posts(tickers: list[str]) -> list[dict]:
                     "unavailable: local Chromium missing Linux libs; set PLAYWRIGHT_CDP_URL",
                 )
                 print(f"[sentiment] X scrape failed; local Chromium missing Linux libs: {exc}")
-                return []
+                return api_posts
             _mark_source("x", f"unavailable: scrape failed: {exc}")
             print(f"[sentiment] X scrape failed: {exc}")
-            return []
+            return api_posts
 
     if not X_RUNTIME_BROWSER_INSTALL:
         _mark_source(
             "x",
             "unavailable: Chromium missing; use Vercel functions-beta or set X_RUNTIME_BROWSER_INSTALL=true",
         )
-        return []
+        return api_posts
 
     if not _install_playwright_browser():
-        return []
+        return api_posts
 
     try:
-        return _scrape_x_with_playwright(sync_playwright, PlaywrightTimeoutError, search_urls)
+        scraped = _scrape_x_with_playwright(sync_playwright, PlaywrightTimeoutError, search_urls)
+        return api_posts + scraped
     except Exception as exc:
         _mark_source("x", f"unavailable: scrape failed after browser install: {exc}")
         print(f"[sentiment] X scrape failed after browser install: {exc}")
-        return []
+        return api_posts
 
 
 def _x_search_url(ticker: str) -> str:

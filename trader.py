@@ -135,11 +135,11 @@ def run_auth_wizard(client: SchwabClient):
 
 def run_training():
     print("\n📊 Fetching stock universe for training…")
-    research_df = run_market_research(max_candidates=80, verbose=False)
+    research_df = run_market_research(max_candidates=200, verbose=False)
     if research_df.empty:
         print("[error] No candidates found.")
         return
-    tickers = research_df["ticker"].tolist()[:60]   # top 60 for manageable training
+    tickers = research_df["ticker"].tolist()[:150]   # large universe for better generalization
     print(f"Training on {len(tickers)} stocks: {tickers[:10]}…")
     bundle = train_model(tickers, forward_days=5, min_return=0.015, verbose=True)
     print("\n✅ Training complete.")

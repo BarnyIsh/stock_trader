@@ -231,20 +231,33 @@ def _fetch_reddit_listing_with_playwright(
     listing: str,
     params: dict | None = None,
 ) -> tuple[list[dict], str | None]:
-    """Fetch Reddit JSON listing via a Playwright browser (remote or local)."""
+    """Fetch Reddit JSON listing via a Playwright browser (remote or local).
+    NOTE: This is the single-call version kept for backward compat.
+    Prefer _fetch_reddit_bulk_with_playwright for multiple listings.
+    """
+    results = _fetch_reddit_bulk_with_playwright([(subreddit, listing, params)])
+    if results:
+        return results[0]
+    return [], "no results from bulk fetch"
 
-    if listing == "hot":
-        url = f"https://www.reddit.com/r/{subreddit}.json"
-    else:
-        url = f"https://www.reddit.com/r/{subreddit}/{listing}.json"
-    if params:
-        query = "&".join(f"{key}={quote_plus(str(value))}" for key, value in params.items())
-        url = f"{url}?{query}"
+
+def _fetch_reddit_bulk_with_playwright(
+    requests_list: list[tuple[str, str, dict | None]],
+) -> list[tuple[list[dict], str | None]]:
+    """
+    Fetch multiple Reddit JSON listings using a SINGLE browser connection.
+    Each item in requests_list is (subreddit, listing, params).
+    Returns a list of (posts, error) tuples in the same order.
+    """
+    if not requests_list:
+        return []
 
     try:
         from playwright.sync_api import sync_playwright
     except Exception as exc:
-        return [], f"Playwright import failed: {exc}"
+        return [([], f"Playwright import failed: {exc}")] * len(requests_list)
+
+    results: list[tuple[list[dict], str | None]] = []
 
     try:
         with sync_playwright() as p:
@@ -256,109 +269,145 @@ def _fetch_reddit_listing_with_playwright(
             _add_cookie_header_cookies(context, REDDIT_COOKIE, ".reddit.com")
             page = context.new_page()
 
-            # Use route to intercept and get JSON response directly
-            json_response = {}
-
-            def handle_response(response):
-                nonlocal json_response
-                if response.url.startswith(url.split("?")[0]) and response.status == 200:
-                    try:
-                        json_response = response.json()
-                    except Exception:
-                        pass
-
-            page.on("response", handle_response)
-            page.goto(url, wait_until="networkidle", timeout=int(REQUEST_TIMEOUT * 2000))
-
-            # If we caught the response via event listener, use it
-            if json_response and "data" in json_response:
-                payload = json_response
-            else:
-                # Fall back to reading body text
-                text = page.locator("body").inner_text(timeout=int(REQUEST_TIMEOUT * 1000)).strip()
-                # Try to find JSON in potentially wrapped content
-                if text.startswith("{"):
-                    payload = json.loads(text)
+            for subreddit, listing, params in requests_list:
+                if listing == "hot":
+                    url = f"https://www.reddit.com/r/{subreddit}.json"
                 else:
-                    # Some pages wrap JSON in <pre> or other elements
-                    pre = page.locator("pre").first
-                    try:
-                        pre_text = pre.inner_text(timeout=2000).strip()
-                        payload = json.loads(pre_text)
-                    except Exception:
-                        match = re.search(r"(\{\"kind\".*\})\s*$", text, flags=re.DOTALL)
-                        if not match:
-                            browser.close()
-                            return [], f"remote browser returned non-json from r/{subreddit}/{listing}"
-                        payload = json.loads(match.group(1))
+                    url = f"https://www.reddit.com/r/{subreddit}/{listing}.json"
+                if params:
+                    query = "&".join(
+                        f"{key}={quote_plus(str(value))}" for key, value in params.items()
+                    )
+                    url = f"{url}?{query}"
+
+                try:
+                    json_response = {}
+
+                    def make_handler(target_url):
+                        def handler(response):
+                            nonlocal json_response
+                            if (
+                                response.url.startswith(target_url.split("?")[0])
+                                and response.status == 200
+                            ):
+                                try:
+                                    json_response = response.json()
+                                except Exception:
+                                    pass
+                        return handler
+
+                    listener = make_handler(url)
+                    page.on("response", listener)
+                    page.goto(url, wait_until="networkidle", timeout=int(REQUEST_TIMEOUT * 2000))
+                    page.remove_listener("response", listener)
+
+                    if json_response and "data" in json_response:
+                        payload = json_response
+                    else:
+                        text = page.locator("body").inner_text(
+                            timeout=int(REQUEST_TIMEOUT * 1000)
+                        ).strip()
+                        if text.startswith("{"):
+                            payload = json.loads(text)
+                        else:
+                            pre = page.locator("pre").first
+                            try:
+                                pre_text = pre.inner_text(timeout=2000).strip()
+                                payload = json.loads(pre_text)
+                            except Exception:
+                                match = re.search(
+                                    r"(\{\"kind\".*\})\s*$", text, flags=re.DOTALL
+                                )
+                                if not match:
+                                    results.append(
+                                        ([], f"non-json from r/{subreddit}/{listing}")
+                                    )
+                                    continue
+                                payload = json.loads(match.group(1))
+
+                    rows = []
+                    for child in payload.get("data", {}).get("children", []):
+                        post = child.get("data", {}) or {}
+                        post.setdefault("subreddit", subreddit)
+                        rows.append(post)
+                    results.append((rows, None))
+
+                except Exception as exc:
+                    results.append(([], f"r/{subreddit}/{listing}: {exc}"))
+
+                time.sleep(0.3)  # small delay between pages to be polite
 
             browser.close()
 
-        rows = []
-        children = payload.get("data", {}).get("children", [])
-        for child in children:
-            post = child.get("data", {}) or {}
-            post.setdefault("subreddit", subreddit)
-            rows.append(post)
-        return rows, None
     except Exception as exc:
-        return [], f"remote browser failed: {exc}"
+        # Browser connection failed entirely (e.g. 429 from Browserless)
+        error_msg = f"remote browser failed: {exc}"
+        # Fill remaining results with the error
+        while len(results) < len(requests_list):
+            results.append(([], error_msg))
+
+    return results
 
 
 def _fetch_reddit_posts() -> list[dict]:
     headers = _reddit_headers()
     posts = []
     errors = []
-    browser_posts = []
-    browser_errors = []
     subreddits = _reddit_subreddit_names()
     if not subreddits:
         _mark_source("reddit", "not configured")
         return []
 
-    # Track whether direct JSON fetches are working (they fail on Vercel IPs)
-    direct_blocked = False
+    # Try direct JSON fetch first for one listing to test connectivity
+    test_rows, test_error = _fetch_reddit_listing(subreddits[0], "hot", headers)
+    direct_works = bool(test_rows)
 
-    for subreddit in subreddits:
-        for listing in REDDIT_LISTINGS:
-            params = None if listing == "hot" else {"limit": 75}
-            if listing == "top" and params is not None:
-                params["t"] = REDDIT_TOP_TIME_FILTER
-
-            # Try direct JSON fetch first (works locally, often blocked on Vercel)
-            if not direct_blocked:
+    if direct_works:
+        # Direct fetch works — use it for everything (local or unblocked IP)
+        posts.extend(test_rows)
+        for subreddit in subreddits:
+            for listing in REDDIT_LISTINGS:
+                if subreddit == subreddits[0] and listing == "hot":
+                    continue  # already fetched
+                params = None if listing == "hot" else {"limit": 75}
+                if listing == "top" and params is not None:
+                    params["t"] = REDDIT_TOP_TIME_FILTER
                 rows, error = _fetch_reddit_listing(subreddit, listing, headers, params)
-                if rows:
-                    posts.extend(rows)
-                    time.sleep(0.05)
-                    continue
+                posts.extend(rows)
                 if error:
                     errors.append(error)
-                    direct_blocked = True  # skip direct for remaining subreddits
-
-            # Fall back to remote browser
-            browser_rows, browser_error = _fetch_reddit_listing_with_playwright(
-                subreddit, listing, params
-            )
-            browser_posts.extend(browser_rows)
-            if browser_error:
-                browser_errors.append(f"r/{subreddit} {listing}: {browser_error}")
-            time.sleep(0.05)
-
-    deduped = _dedupe_posts(posts + browser_posts)
-    if deduped:
-        if browser_posts and not posts:
-            _mark_source("reddit", f"ok: fetched {len(deduped)} posts via remote browser")
-        elif browser_posts:
-            _mark_source("reddit", f"ok: fetched {len(deduped)} posts (direct + remote browser)")
-        else:
-            _mark_source("reddit", f"ok: fetched {len(deduped)} posts")
+                time.sleep(0.05)
     else:
-        sample = "; ".join((browser_errors or errors)[:2])
+        # Direct fetch blocked — use ONE browser connection for all listings
+        if test_error:
+            errors.append(test_error)
+
+        browser_requests = []
+        for subreddit in subreddits:
+            for listing in REDDIT_LISTINGS:
+                params = None if listing == "hot" else {"limit": 75}
+                if listing == "top" and params is not None:
+                    params["t"] = REDDIT_TOP_TIME_FILTER
+                browser_requests.append((subreddit, listing, params))
+
+        results = _fetch_reddit_bulk_with_playwright(browser_requests)
+        for rows, error in results:
+            posts.extend(rows)
+            if error:
+                errors.append(error)
+
+    deduped = _dedupe_posts(posts)
+    if deduped:
+        if direct_works:
+            _mark_source("reddit", f"ok: fetched {len(deduped)} posts")
+        else:
+            _mark_source("reddit", f"ok: fetched {len(deduped)} posts via remote browser")
+    else:
+        sample = "; ".join(errors[:2])
         if sample:
             _mark_source("reddit", f"unavailable: public JSON blocked ({sample})")
         else:
-            _mark_source("reddit", "unavailable: public JSON returned no posts")
+            _mark_source("reddit", "unavailable: no posts returned")
     return deduped
 
 
@@ -431,14 +480,22 @@ def _fetch_x_posts(tickers: list[str]) -> list[dict]:
     if api_ok:
         return api_posts
 
-    # Fallback: Playwright scraping
+    # If API failed and we have auth cookies + a remote browser, try scraping
+    # But ONLY if we have both cookies AND a CDP endpoint — otherwise skip
+    if not (X_AUTH_TOKEN and X_CT0 and (PLAYWRIGHT_CDP_URL or PLAYWRIGHT_WS_ENDPOINT)):
+        if api_posts:
+            _mark_source("x", f"partial: got {len(api_posts)} posts from API before failure")
+        else:
+            _mark_source("x", "unavailable: API auth failed; set valid X_BEARER_TOKEN")
+        return api_posts
+
+    # Playwright scraping fallback (uses remote browser)
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
         from playwright.sync_api import sync_playwright
     except Exception as exc:
-        _mark_source("x", f"unavailable: Playwright import failed: {exc}")
-        print(f"[sentiment] X scrape skipped; Playwright import failed: {exc}")
-        return api_posts  # return whatever the API got before failing
+        _mark_source("x", f"unavailable: API failed, Playwright import failed: {exc}")
+        return api_posts
 
     search_urls = [_x_search_url(ticker) for ticker in selected]
 
@@ -446,34 +503,10 @@ def _fetch_x_posts(tickers: list[str]) -> list[dict]:
         scraped = _scrape_x_with_playwright(sync_playwright, PlaywrightTimeoutError, search_urls)
         return api_posts + scraped
     except Exception as exc:
-        if "Executable doesn't exist" not in str(exc):
-            if _playwright_system_lib_missing(exc):
-                _mark_source(
-                    "x",
-                    "unavailable: local Chromium missing Linux libs; set PLAYWRIGHT_CDP_URL",
-                )
-                print(f"[sentiment] X scrape failed; local Chromium missing Linux libs: {exc}")
-                return api_posts
-            _mark_source("x", f"unavailable: scrape failed: {exc}")
-            print(f"[sentiment] X scrape failed: {exc}")
-            return api_posts
-
-    if not X_RUNTIME_BROWSER_INSTALL:
-        _mark_source(
-            "x",
-            "unavailable: Chromium missing; use Vercel functions-beta or set X_RUNTIME_BROWSER_INSTALL=true",
-        )
-        return api_posts
-
-    if not _install_playwright_browser():
-        return api_posts
-
-    try:
-        scraped = _scrape_x_with_playwright(sync_playwright, PlaywrightTimeoutError, search_urls)
-        return api_posts + scraped
-    except Exception as exc:
-        _mark_source("x", f"unavailable: scrape failed after browser install: {exc}")
-        print(f"[sentiment] X scrape failed after browser install: {exc}")
+        if _playwright_system_lib_missing(exc):
+            _mark_source("x", "unavailable: API failed, local Chromium missing libs")
+        else:
+            _mark_source("x", f"unavailable: API failed, scrape failed: {exc}")
         return api_posts
 
 

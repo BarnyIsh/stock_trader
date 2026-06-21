@@ -26,7 +26,7 @@ import requests
 
 REDDIT_SUBREDDITS = os.getenv(
     "REDDIT_SUBREDDITS",
-    "wallstreetbets+investing+stocks+news",
+    "wallstreetbets+investing+stocks+stockmarket+options+finance",
 )
 REDDIT_USER_AGENT = os.getenv(
     "REDDIT_USER_AGENT",
@@ -38,20 +38,21 @@ REDDIT_USER_AGENT = os.getenv(
 REDDIT_COOKIE = os.getenv("REDDIT_COOKIE", "").strip()
 REDDIT_LISTINGS = [
     item.strip()
-    for item in os.getenv("REDDIT_LISTINGS", "hot,new,rising,top").split(",")
+    for item in os.getenv("REDDIT_LISTINGS", "hot,top,rising").split(",")
     if item.strip()
 ]
 REDDIT_TOP_TIME_FILTER = os.getenv("REDDIT_TOP_TIME_FILTER", "day")
-X_TOP_N = int(os.getenv("X_TOP_N", "12"))
-X_SEARCH_PAGES = int(os.getenv("X_SEARCH_PAGES", "2"))
+X_TOP_N = int(os.getenv("X_TOP_N", "20"))
+X_SEARCH_PAGES = int(os.getenv("X_SEARCH_PAGES", "3"))
 X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "").strip()
 X_CT0 = os.getenv("X_CT0", "").strip()
 X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
 X_RUNTIME_BROWSER_INSTALL = os.getenv("X_RUNTIME_BROWSER_INSTALL", "false").lower() == "true"
 PLAYWRIGHT_CDP_URL = os.getenv("PLAYWRIGHT_CDP_URL", "").strip()
 PLAYWRIGHT_WS_ENDPOINT = os.getenv("PLAYWRIGHT_WS_ENDPOINT", "").strip()
-SENTIMENT_MAX_ADJUST = float(os.getenv("SENTIMENT_MAX_ADJUST", "0.12"))
-NEWS_TOP_N = int(os.getenv("NEWS_TOP_N", "12"))
+SENTIMENT_MAX_ADJUST = float(os.getenv("SENTIMENT_MAX_ADJUST", "0.18"))
+TRENDING_BOOST = float(os.getenv("TRENDING_BOOST", "0.06"))
+NEWS_TOP_N = int(os.getenv("NEWS_TOP_N", "15"))
 REQUEST_TIMEOUT = float(os.getenv("SENTIMENT_REQUEST_TIMEOUT", "10"))
 SOURCE_STATUS: dict[str, str] = {}
 PLAYWRIGHT_BROWSER_PATH = os.getenv(
@@ -294,7 +295,8 @@ def _reddit_page_fetch(page, subreddit: str, listing: str, params: dict | None) 
 
 
 def _x_page_scrape(context, search_urls: list[str]) -> list[dict]:
-    """Scrape X search results using an existing browser context."""
+    """Scrape X search results using an existing browser context.
+    Optimized for high-engagement posts — scrapes multiple pages per query."""
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
     _add_x_session_cookies(context)
@@ -304,16 +306,17 @@ def _x_page_scrape(context, search_urls: list[str]) -> list[dict]:
     seen: set[str] = set()
     login_required = False
     empty_reason = ""
+    max_posts = 150  # increased cap for better coverage
 
     for search_url in search_urls:
         try:
             page.goto(search_url, wait_until="domcontentloaded", timeout=15000)
         except Exception as exc:
             if "closed" in str(exc).lower():
-                break  # browser killed — stop entirely
+                break
             continue
 
-        # Wait for tweets to render (X is JS-heavy)
+        # Wait for tweets to render
         try:
             page.wait_for_selector("article[data-testid='tweet']", timeout=8000)
         except (PlaywrightTimeoutError, Exception):
@@ -321,38 +324,11 @@ def _x_page_scrape(context, search_urls: list[str]) -> list[dict]:
             if _x_login_required(page):
                 login_required = True
                 break
-            continue  # try next ticker
-
-        # Scrape visible tweets
-        try:
-            articles = page.locator("article[data-testid='tweet']").all()
-            for article in articles:
-                text = _x_article_text(article)
-                if not text:
-                    continue
-                key = re.sub(r"\s+", " ", text).strip()[:240]
-                if key in seen:
-                    continue
-                seen.add(key)
-                posts.append({
-                    "text": text,
-                    "public_metrics": _x_article_metrics(article),
-                })
-                if len(posts) >= 80:
-                    break
-        except Exception as exc:
-            if "closed" in str(exc).lower():
-                break
             continue
 
-        if len(posts) >= 80:
-            break
-
-        # Scroll once for more tweets (don't over-scroll — saves time and avoids close)
-        if X_SEARCH_PAGES > 1:
+        # Scrape multiple scroll pages for this search
+        for scroll_pass in range(X_SEARCH_PAGES):
             try:
-                page.mouse.wheel(0, 2000)
-                page.wait_for_timeout(1200)
                 articles = page.locator("article[data-testid='tweet']").all()
                 for article in articles:
                     text = _x_article_text(article)
@@ -366,11 +342,25 @@ def _x_page_scrape(context, search_urls: list[str]) -> list[dict]:
                         "text": text,
                         "public_metrics": _x_article_metrics(article),
                     })
-                    if len(posts) >= 80:
+                    if len(posts) >= max_posts:
                         break
-            except Exception:
-                pass  # scroll failed, that's fine — we have what we have
+            except Exception as exc:
+                if "closed" in str(exc).lower():
+                    break
+                continue
 
+            if len(posts) >= max_posts:
+                break
+
+            # Scroll for more
+            try:
+                page.mouse.wheel(0, 2500)
+                page.wait_for_timeout(1500)
+            except Exception:
+                break
+
+        if len(posts) >= max_posts:
+            break
         if _x_login_required(page):
             login_required = True
             break
@@ -526,16 +516,17 @@ def _fetch_reddit_posts() -> list[dict]:
 
 
 def _fetch_reddit_rss(subreddits: list[str]) -> list[dict]:
-    """Fetch Reddit posts via RSS feeds. No auth, no browser needed."""
+    """Fetch Reddit posts via RSS feeds. No auth, no browser needed.
+    Targets high-engagement posts by fetching 'top' and 'hot' listings."""
     posts = []
     for subreddit in subreddits:
         for listing in REDDIT_LISTINGS:
             if listing == "hot":
-                url = f"https://www.reddit.com/r/{subreddit}/.rss"
+                url = f"https://www.reddit.com/r/{subreddit}/.rss?limit=100"
             elif listing == "top":
-                url = f"https://www.reddit.com/r/{subreddit}/top/.rss?t={REDDIT_TOP_TIME_FILTER}"
+                url = f"https://www.reddit.com/r/{subreddit}/top/.rss?t={REDDIT_TOP_TIME_FILTER}&limit=100"
             else:
-                url = f"https://www.reddit.com/r/{subreddit}/{listing}/.rss"
+                url = f"https://www.reddit.com/r/{subreddit}/{listing}/.rss?limit=100"
 
             try:
                 resp = requests.get(
@@ -549,35 +540,39 @@ def _fetch_reddit_rss(subreddits: list[str]) -> list[dict]:
                 if resp.status_code == 403:
                     continue
                 if resp.status_code == 429:
-                    # Rate limited — wait and try next subreddit
                     time.sleep(2.0)
                     continue
                 resp.raise_for_status()
 
                 root = ET.fromstring(resp.content)
-                # Atom feed namespace
                 ns = {"atom": "http://www.w3.org/2005/Atom"}
 
-                for entry in root.findall(".//atom:entry", ns):
+                # RSS ordering reflects Reddit's ranking — top/hot posts first
+                # Assign descending engagement proxy based on position
+                entries = root.findall(".//atom:entry", ns)
+                for rank, entry in enumerate(entries):
                     title = entry.findtext("atom:title", default="", namespaces=ns)
                     content = entry.findtext("atom:content", default="", namespaces=ns)
-                    # Strip HTML from content
                     clean_content = re.sub(r"<[^>]+>", " ", content)
-                    # Extract subreddit from category
                     category = entry.find("atom:category", ns)
                     sub = category.get("label", subreddit) if category is not None else subreddit
+
+                    # Infer engagement from position (top posts come first in RSS)
+                    # Top post ≈ thousands of upvotes, position 25 ≈ hundreds
+                    inferred_score = max(1, int(500 * math.exp(-rank * 0.12)))
+                    inferred_comments = max(0, int(inferred_score * 0.3))
 
                     posts.append({
                         "title": title,
                         "selftext": clean_content[:2000],
                         "subreddit": sub,
-                        "num_comments": 0,
-                        "score": 0,
+                        "num_comments": inferred_comments,
+                        "score": inferred_score,
+                        "listing": listing,
                     })
             except Exception as exc:
                 print(f"[sentiment] Reddit RSS r/{subreddit}/{listing} failed: {exc}")
                 continue
-            # Delay between requests to avoid rate limiting
             time.sleep(1.0)
 
     return _dedupe_posts(posts) if posts else []
@@ -661,17 +656,23 @@ def _fetch_x_posts_api(tickers: list[str]) -> tuple[list[dict], bool]:
 
 
 def _fetch_x_posts(tickers: list[str]) -> list[dict]:
-    """Fetch X posts via Playwright scraping (primary) or API (if available)."""
+    """Fetch X posts via Playwright scraping (primary) or API (if available).
+    Includes both ticker-specific and broad trending market searches."""
     selected = tickers[:X_TOP_N]
     if not selected:
         _mark_source("x", "no tickers")
         return []
 
+    # Build search URLs: ticker-specific + broad trending for discovery
+    search_urls = (
+        [_x_search_url(t) for t in selected]
+        + _x_trending_search_urls()
+    )
+
     # Primary path: Playwright scraping via PLAYWRIGHT_CDP_URL
     if PLAYWRIGHT_CDP_URL or PLAYWRIGHT_WS_ENDPOINT:
-        x_search_urls = [_x_search_url(t) for t in selected]
         try:
-            _, x_posts = _fetch_all_browser_sources([], x_search_urls)
+            _, x_posts = _fetch_all_browser_sources([], search_urls)
             if x_posts:
                 return x_posts
         except Exception as exc:
@@ -692,6 +693,20 @@ def _fetch_x_posts(tickers: list[str]) -> list[dict]:
 def _x_search_url(ticker: str) -> str:
     query = f"${ticker} (stock OR stocks OR earnings OR shares OR market) lang:en"
     return f"https://x.com/search?q={quote_plus(query)}&src=typed_query&f=live"
+
+
+def _x_trending_search_urls() -> list[str]:
+    """Generate X search URLs for broad market trending topics."""
+    queries = [
+        "stock market today trending lang:en",
+        "$SPY OR $QQQ OR $NVDA OR $TSLA OR $AAPL lang:en",
+        "stocks to buy today lang:en min_faves:50",
+        "earnings beat OR earnings miss lang:en",
+    ]
+    return [
+        f"https://x.com/search?q={quote_plus(q)}&src=typed_query&f=top"
+        for q in queries
+    ]
 
 
 def _scrape_x_with_playwright(sync_playwright, timeout_error, search_urls: list[str]) -> list[dict]:
@@ -1001,7 +1016,10 @@ def build_sentiment_overlay(
     if needs_browser:
         # All Reddit strategies failed — use shared browser for Reddit + X
         reddit_requests = _build_reddit_browser_requests()
-        x_search_urls = [_x_search_url(t) for t in ranked_tickers[:X_TOP_N]]
+        x_search_urls = (
+            [_x_search_url(t) for t in ranked_tickers[:X_TOP_N]]
+            + _x_trending_search_urls()
+        )
         reddit_posts, x_posts = _fetch_all_browser_sources(reddit_requests, x_search_urls)
     else:
         # Reddit worked without browser — use X API independently
@@ -1134,18 +1152,28 @@ def build_sentiment_overlay(
             + math.log1p(max(item.reddit_comments, 0))
             + math.log1p(max(item.x_likes + item.x_retweets, 0))
         )
-        z_attention = max(0.0, min(2.0, (count - mean_attention) / std_attention))
-        item.attention_score = z_attention / 2.0
+        z_attention = max(0.0, min(3.0, (count - mean_attention) / std_attention))
+        item.attention_score = z_attention / 3.0
 
+        # Weighted sentiment across all sources
         sentiment = (
-            0.55 * item.weighted_news_sentiment
-            + 0.18 * item.reddit_sentiment
-            + 0.12 * item.x_sentiment
-            + 0.20 * item.attention_score
+            0.50 * item.weighted_news_sentiment
+            + 0.22 * item.reddit_sentiment
+            + 0.18 * item.x_sentiment
+            + 0.10 * item.attention_score
         )
+
+        # Trending boost: if attention is > 1.5 std above mean AND sentiment
+        # is strongly directional (|sentiment| > 0.3), apply extra boost
+        trending_bonus = 0.0
+        if z_attention > 1.5 and abs(sentiment) > 0.3:
+            # High attention + strong directional sentiment = confidence signal
+            trending_bonus = TRENDING_BOOST * (1 if sentiment > 0 else -1)
+
         item.sentiment_adjustment = max(
-            -SENTIMENT_MAX_ADJUST,
-            min(SENTIMENT_MAX_ADJUST, sentiment * SENTIMENT_MAX_ADJUST),
+            -(SENTIMENT_MAX_ADJUST + TRENDING_BOOST),
+            min(SENTIMENT_MAX_ADJUST + TRENDING_BOOST,
+                sentiment * SENTIMENT_MAX_ADJUST + trending_bonus),
         )
         item.adjusted_prob_buy = float(base_probs.get(ticker, 0.0)) + item.sentiment_adjustment
 

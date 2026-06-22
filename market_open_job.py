@@ -1,9 +1,11 @@
 """
-market_open_job.py - Serverless-friendly daily market-open intent email.
+market_open_job.py - Serverless-friendly daily market-open paper trading email.
 
-This module avoids Schwab order execution. It only scores the latest trained
-model, computes paper buy/sell intents, and emails the result.
+Scores stocks, executes paper trades, tracks portfolio P&L, and emails results.
+Portfolio state persists between warm invocations via /tmp cache.
 """
+
+from __future__ import annotations
 
 import json
 import os
@@ -79,6 +81,25 @@ def _load_model_bundle() -> dict:
 
 
 def _portfolio_from_env() -> Portfolio:
+    """Load portfolio state: /tmp cache > env var > default."""
+    # Check /tmp state file first (persists between warm invocations)
+    state_cache = Path("/tmp/stock_trader_portfolio.json")
+    if state_cache.exists():
+        try:
+            state = json.loads(state_cache.read_text())
+            portfolio = Portfolio(
+                cash=float(state.get("cash", 100_000.0)),
+                peak_value=float(state.get("peak_value", state.get("cash", 100_000.0))),
+            )
+            portfolio.positions = {
+                ticker: Position(**position)
+                for ticker, position in state.get("positions", {}).items()
+            }
+            portfolio.trade_log = state.get("trade_log", [])
+            return portfolio
+        except Exception:
+            pass
+
     raw = os.getenv("PORTFOLIO_STATE_JSON", "").strip()
     if not raw:
         return Portfolio.load()
@@ -94,6 +115,20 @@ def _portfolio_from_env() -> Portfolio:
     }
     portfolio.trade_log = state.get("trade_log", [])
     return portfolio
+
+
+def _save_portfolio_state(portfolio: Portfolio):
+    """Persist portfolio state to /tmp for next warm invocation."""
+    state = {
+        "cash": portfolio.cash,
+        "peak_value": portfolio.peak_value,
+        "positions": {
+            ticker: asdict(pos) for ticker, pos in portfolio.positions.items()
+        },
+        "trade_log": portfolio.trade_log[-200:],  # keep last 200 trades
+    }
+    state_cache = Path("/tmp/stock_trader_portfolio.json")
+    state_cache.write_text(json.dumps(state, indent=2, default=str))
 
 
 def _plain_trade_table(rows: list[dict]) -> str:
@@ -211,31 +246,92 @@ def _top_scores_html(top: pd.DataFrame) -> str:
     )
 
 
+def _positions_html(portfolio: "Portfolio", prices: dict) -> str:
+    """Render current holdings as an HTML table."""
+    if not portfolio.positions:
+        return (
+            "<div style='padding:14px;border:1px solid #e5e7eb;border-radius:8px;"
+            "background:#f9fafb;color:#374151'>No open positions.</div>"
+        )
+    rows = []
+    for ticker, pos in portfolio.positions.items():
+        price = prices.get(ticker, pos.avg_cost)
+        pnl = (price - pos.avg_cost) * pos.shares
+        pnl_pct = (price / pos.avg_cost - 1) * 100 if pos.avg_cost > 0 else 0
+        color = "#166534" if pnl >= 0 else "#991b1b"
+        rows.append(
+            "<tr>"
+            f"<td style='padding:8px;font-weight:700'>{escape(ticker)}</td>"
+            f"<td style='padding:8px;text-align:right'>{int(pos.shares):,}</td>"
+            f"<td style='padding:8px;text-align:right'>{_fmt_money(pos.avg_cost)}</td>"
+            f"<td style='padding:8px;text-align:right'>{_fmt_money(price)}</td>"
+            f"<td style='padding:8px;text-align:right;color:{color};font-weight:700'>"
+            f"${pnl:+,.0f} ({pnl_pct:+.1f}%)</td>"
+            f"<td style='padding:8px;text-align:right'>{_fmt_money(pos.stop_loss)}</td>"
+            f"<td style='padding:8px;text-align:right'>{_fmt_money(pos.target_price)}</td>"
+            "</tr>"
+        )
+    return (
+        "<table style='width:100%;border-collapse:collapse;font-size:13px'>"
+        "<thead><tr style='background:#f3f4f6;color:#374151'>"
+        "<th style='padding:8px;text-align:left'>Ticker</th>"
+        "<th style='padding:8px;text-align:right'>Shares</th>"
+        "<th style='padding:8px;text-align:right'>Avg Cost</th>"
+        "<th style='padding:8px;text-align:right'>Now</th>"
+        "<th style='padding:8px;text-align:right'>P&L</th>"
+        "<th style='padding:8px;text-align:right'>Stop</th>"
+        "<th style='padding:8px;text-align:right'>Target</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
 def _build_html_email(
     now_ny: datetime,
     decisions: dict,
     trade_rows: list[dict],
     top: pd.DataFrame,
     source_status: dict,
+    portfolio: "Portfolio" = None,
+    prices: dict = None,
 ) -> str:
     source_html = "".join(
         _source_badge(name, status)
         for name, status in source_status.items()
     )
+
+    # Portfolio P&L section
+    total_value = decisions["portfolio_value"]
+    total_pnl = total_value - 100_000.0
+    total_return = (total_value / 100_000.0 - 1) * 100
+    pnl_color = "#166534" if total_pnl >= 0 else "#991b1b"
+
+    positions_section = ""
+    if portfolio and prices:
+        positions_section = f"""
+        <h2 style="font-size:18px;margin:24px 0 10px">Current Holdings ({len(portfolio.positions)})</h2>
+        {_positions_html(portfolio, prices)}
+        """
+
     return f"""\
 <!doctype html>
 <html>
   <body style="margin:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;color:#111827">
     <div style="max-width:860px;margin:0 auto;padding:24px">
       <div style="background:#111827;color:white;padding:22px 24px;border-radius:12px 12px 0 0">
-        <div style="font-size:13px;color:#cbd5e1">Stock Trader Market-Open Intent Log</div>
+        <div style="font-size:13px;color:#cbd5e1">Stock Trader — Paper Trading Log</div>
         <h1 style="margin:6px 0 0;font-size:24px">{now_ny:%A, %B %d, %Y}</h1>
       </div>
       <div style="background:white;padding:22px 24px;border-radius:0 0 12px 12px;border:1px solid #e5e7eb">
         <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px">
           <div style="padding:12px 14px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px">
             <div style="font-size:12px;color:#6b7280">Portfolio Value</div>
-            <div style="font-size:18px;font-weight:800">{_fmt_money(decisions['portfolio_value'])}</div>
+            <div style="font-size:18px;font-weight:800">{_fmt_money(total_value)}</div>
+          </div>
+          <div style="padding:12px 14px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px">
+            <div style="font-size:12px;color:#6b7280">Total P&L</div>
+            <div style="font-size:18px;font-weight:800;color:{pnl_color}">${total_pnl:+,.0f} ({total_return:+.1f}%)</div>
           </div>
           <div style="padding:12px 14px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px">
             <div style="font-size:12px;color:#6b7280">Cash</div>
@@ -247,8 +343,10 @@ def _build_html_email(
           </div>
         </div>
 
-        <h2 style="font-size:18px;margin:20px 0 10px">Trade Intents</h2>
+        <h2 style="font-size:18px;margin:20px 0 10px">Today's Trades</h2>
         {_trade_rows_html(trade_rows)}
+
+        {positions_section}
 
         <h2 style="font-size:18px;margin:24px 0 10px">Data Sources</h2>
         <div>{source_html}</div>
@@ -257,8 +355,8 @@ def _build_html_email(
         {_top_scores_html(top)}
 
         <p style="margin-top:18px;color:#6b7280;font-size:13px;line-height:1.5">
-          Final score = base ML probability plus a capped news/social attention overlay.
-          This is an intent log only; it does not place orders.
+          Paper trading with $100k starting capital. Model executes trades automatically.
+          Sells when stop-loss hit, target reached, or score degrades below threshold.
         </p>
       </div>
     </div>
@@ -328,8 +426,13 @@ def run_market_open_job(send_email: bool = True) -> dict:
         atr_map=atr_map,
     )
 
+    # Execute paper trades on the portfolio (track real P&L)
     score_map = dict(zip(scored_df["ticker"], scored_df["prob_buy"]))
     trade_rows = []
+
+    # Execute sells first
+    if decisions["sells"]:
+        portfolio.apply_sells(decisions["sells"], prices)
     for ticker, shares, reason in decisions["sells"]:
         trade_rows.append({
             "action": "SELL",
@@ -339,6 +442,10 @@ def run_market_open_job(send_email: bool = True) -> dict:
             "reason": reason,
             "prob_buy": float(score_map.get(ticker, 0.0)),
         })
+
+    # Execute buys
+    if decisions["buys"]:
+        portfolio.apply_buys(decisions["buys"], prices, score_map)
     for ticker, shares, limit, stop, target in decisions["buys"]:
         trade_rows.append({
             "action": "BUY",
@@ -350,6 +457,13 @@ def run_market_open_job(send_email: bool = True) -> dict:
             "target": float(target),
             "prob_buy": float(score_map.get(ticker, 0.0)),
         })
+
+    # Compute updated portfolio value after trades
+    updated_value = portfolio.total_value(prices)
+    portfolio.update_peak(updated_value)
+
+    # Persist portfolio state for next run
+    _save_portfolio_state(portfolio)
 
     top_cols = [
         "ticker", "price", "base_prob_buy", "sentiment_adjustment", "prob_buy",
@@ -384,23 +498,36 @@ def run_market_open_job(send_email: bool = True) -> dict:
         trade_rows=trade_rows,
         top=top,
         source_status=source_status,
+        portfolio=portfolio,
+        prices=prices,
     )
 
     log_entry = {
         "date": now_ny.isoformat(),
         "trade_rows": trade_rows,
-        "decisions": {
-            "portfolio_value": decisions["portfolio_value"],
-            "cash": decisions["cash"],
-            "drawdown": decisions["drawdown"],
+        "portfolio": {
+            "value": updated_value,
+            "cash": portfolio.cash,
+            "peak_value": portfolio.peak_value,
+            "drawdown": portfolio.current_drawdown(updated_value),
+            "positions_count": len(portfolio.positions),
+            "total_pnl": updated_value - 100_000.0,  # vs starting capital
+            "total_return_pct": (updated_value / 100_000.0 - 1) * 100,
         },
+        "positions": {
+            ticker: {
+                **asdict(position),
+                "current_price": float(prices.get(ticker, position.avg_cost)),
+                "unrealized_pnl": float(
+                    (prices.get(ticker, position.avg_cost) - position.avg_cost) * position.shares
+                ),
+            }
+            for ticker, position in portfolio.positions.items()
+        },
+        "recent_trades": portfolio.trade_log[-20:],
         "top_scores": top.to_dict(orient="records"),
         "source_status": source_status,
         "sentiment_overlay": overlay_df.head(25).to_dict(orient="records"),
-        "positions": {
-            ticker: asdict(position)
-            for ticker, position in portfolio.positions.items()
-        },
     }
     log_file = LOG_DIR / f"market_open_intents_{now_ny:%Y%m%d_%H%M%S}.json"
     log_file.write_text(json.dumps(log_entry, indent=2, default=str))

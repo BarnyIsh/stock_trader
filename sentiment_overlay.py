@@ -98,35 +98,52 @@ SOURCE_WEIGHTS = {
 # High-influence accounts get 3-5x weight; unknown accounts get base weight.
 # Format: lowercase handle → weight multiplier
 X_ACCOUNT_WEIGHTS: dict[str, float] = {
-    # CEOs / Company leaders
+    # CEOs / Company leaders (their words move their stock directly)
     "elonmusk": 5.0,
     "jensenhuang": 5.0,
-    "satloyal": 4.0,       # Satya Nadella
     "timcook": 4.5,
+    "satloyal": 4.0,
     "sundarpichai": 4.5,
+    "lisasu": 4.5,
+    "brian_armstrong": 3.5,
     "markzuckerberg": 4.0,
-    "jeffbezos": 4.0,
-    "lisasu": 4.5,          # Lisa Su (AMD CEO)
-    "patgelsinger": 3.5,   # Pat Gelsinger (Intel)
-    "brian_armstrong": 3.5,  # Coinbase CEO
+    "sama": 5.0,             # Sam Altman
+    "daborsamiya": 4.0,      # Dario Amodei
+    "jeffbezos": 4.5,
+    "patgelsinger": 3.5,
+    "ajassy": 4.0,           # Andy Jassy
+    "tobi": 3.5,             # Shopify CEO
     # Politicians with market impact
     "realdonaldtrump": 5.0,
     "potus": 4.5,
-    "joebiden": 4.0,
-    "elonmusk": 5.0,
+    "nancypelosi": 4.5,      # Known for well-timed trades
+    "senatorpelosi": 4.5,
+    "speakerjohnson": 3.0,
     # Finance / Investing influencers
-    "jimcramer": 3.0,
-    "chaaborsamiya": 3.5,   # Chamath
-    "chaaborsamiya": 3.5,
-    "cathiedwood": 3.5,
-    "michaeljburry": 4.5,   # Michael Burry
-    "wloeffler": 3.0,       # Kelly Loeffler
-    "gaborsamiya": 3.0,
-    "elerianm": 3.5,        # Mohamed El-Erian
+    "billackman": 4.5,
     "carlicahn": 4.0,
-    "billackman": 4.0,      # Bill Ackman
+    "cathiedwood": 3.5,
+    "michaeljburry": 5.0,    # When Burry speaks, markets listen
+    "chaaborsamiya": 3.5,
     "raydalio": 4.5,
-    "warrenbuffett": 5.0,   # (rarely posts but if he does...)
+    "jimcramer": 2.5,        # Noisy but moves retail
+    "unusual_whales": 3.5,   # Options flow data
+    "dankhin": 3.5,          # Dan Ives, top tech analyst
+    # Company official accounts (product/partnership announcements)
+    "openai": 4.0,
+    "anthropicai": 3.5,
+    "nvidia": 4.0,
+    "spacex": 3.5,
+    "apple": 4.0,
+    "microsoft": 4.0,
+    "google": 4.0,
+    "meta": 3.5,
+    "amazon": 4.0,
+    "tesla": 3.5,
+    "coinbase": 3.0,
+    "shopify": 3.0,
+    "ycombinator": 3.0,
+    "federalreserve": 5.0,   # The Fed moves everything
     # Financial media accounts
     "bloomberg": 3.5,
     "reuters": 3.5,
@@ -134,13 +151,6 @@ X_ACCOUNT_WEIGHTS: dict[str, float] = {
     "wsj": 3.5,
     "ft": 3.0,
     "marketwatch": 2.5,
-    "unusual_whales": 3.0,
-    "dikiycpa": 2.5,        # Market commentary
-    "zaborsamiya": 2.5,
-    # Analysts / Market movers
-    "gaborsamiya": 3.0,
-    "hedgeye": 2.5,
-    "traderflorida": 2.0,
 }
 X_BASE_ACCOUNT_WEIGHT = 0.3  # random unknown accounts
 
@@ -773,11 +783,21 @@ X_INFLUENCER_HANDLES = [
     "lisasu",            # AMD CEO
     "brian_armstrong",    # Coinbase CEO
     "markzuckerberg",    # Meta CEO
+    "daborsamiya",       # Dario Amodei, Anthropic CEO
+    "sama",              # Sam Altman, OpenAI CEO
+    "jeffbezos",         # Amazon / Blue Origin
+    "patgelsinger",      # Intel CEO
+    "shaborsamiya",      # Shoban Narayan, Stripe
+    "tobi",              # Tobi Lütke, Shopify CEO
+    "parkermolloy",      # Andy Jassy, Amazon CEO → actually @ajassy
+    "ajassy",            # Andy Jassy, Amazon CEO
+    "dankhin",           # Dan Ives, Wedbush (top tech analyst)
     # Politicians (trades & policy moves markets)
     "realdonaldtrump",   # Trump
     "potus",             # President
     "speakerjohnson",    # Speaker of the House
-    "senatorpelosi",     # Known stock trader
+    "nancypelosi",       # Nancy Pelosi (known stock trader)
+    "senatorpelosi",     # alt handle
     # Finance / Investors
     "billackman",        # Bill Ackman (Pershing Square)
     "carlicahn",         # Carl Icahn
@@ -785,7 +805,25 @@ X_INFLUENCER_HANDLES = [
     "michaeljburry",     # Michael Burry
     "chaaborsamiya",     # Chamath
     "unusual_whales",    # Options flow tracker
-    "jimcramer",         # CNBC (inverse signal for some)
+    "jimcramer",         # CNBC
+    "raydalio",          # Ray Dalio
+    # Company official accounts
+    "openai",            # OpenAI
+    "anthropicai",       # Anthropic
+    "nvidia",            # NVIDIA
+    "spacex",            # SpaceX
+    "apple",             # Apple
+    "microsoft",         # Microsoft
+    "google",            # Google
+    "meta",              # Meta
+    "amazon",            # Amazon
+    "tesla",             # Tesla
+    "coinbase",          # Coinbase
+    "palaborsamiya",     # Palantir
+    "shopify",           # Shopify
+    "stripe",            # Stripe
+    "aaborsamiya",       # a16z (Andreessen Horowitz)
+    "ycombinator",       # Y Combinator
     # Financial media
     "bloomberg",
     "reuters",
@@ -793,7 +831,7 @@ X_INFLUENCER_HANDLES = [
     "wsj",
     "ft",
     "marketwatch",
-    "zaborsamiya",
+    "federalreserve",    # The Fed
 ]
 
 
@@ -810,8 +848,11 @@ def _x_influencer_search_urls() -> list[str]:
         urls.append(
             f"https://x.com/search?q={quote_plus(query)}&src=typed_query&f=live"
         )
-    # Also add direct profile timeline URLs for top 5 most impactful accounts
-    top_accounts = ["elonmusk", "realdonaldtrump", "jensenhuang", "billackman", "unusual_whales"]
+    # Also add direct profile timeline URLs for most impactful accounts
+    top_accounts = [
+        "elonmusk", "realdonaldtrump", "jensenhuang", "sama",
+        "billackman", "unusual_whales", "nvidia", "openai", "federalreserve",
+    ]
     for handle in top_accounts:
         urls.append(f"https://x.com/{handle}")
     return urls

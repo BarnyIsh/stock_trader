@@ -94,6 +94,56 @@ SOURCE_WEIGHTS = {
     "twitter": 0.70,
 }
 
+# X/Twitter account credibility weights.
+# High-influence accounts get 3-5x weight; unknown accounts get base weight.
+# Format: lowercase handle → weight multiplier
+X_ACCOUNT_WEIGHTS: dict[str, float] = {
+    # CEOs / Company leaders
+    "elonmusk": 5.0,
+    "jensenhuang": 5.0,
+    "satloyal": 4.0,       # Satya Nadella
+    "timcook": 4.5,
+    "sundarpichai": 4.5,
+    "markzuckerberg": 4.0,
+    "jeffbezos": 4.0,
+    "lisasu": 4.5,          # Lisa Su (AMD CEO)
+    "patgelsinger": 3.5,   # Pat Gelsinger (Intel)
+    "brian_armstrong": 3.5,  # Coinbase CEO
+    # Politicians with market impact
+    "realdonaldtrump": 5.0,
+    "potus": 4.5,
+    "joebiden": 4.0,
+    "elonmusk": 5.0,
+    # Finance / Investing influencers
+    "jimcramer": 3.0,
+    "chaaborsamiya": 3.5,   # Chamath
+    "chaaborsamiya": 3.5,
+    "cathiedwood": 3.5,
+    "michaeljburry": 4.5,   # Michael Burry
+    "wloeffler": 3.0,       # Kelly Loeffler
+    "gaborsamiya": 3.0,
+    "elerianm": 3.5,        # Mohamed El-Erian
+    "carlicahn": 4.0,
+    "billackman": 4.0,      # Bill Ackman
+    "raydalio": 4.5,
+    "warrenbuffett": 5.0,   # (rarely posts but if he does...)
+    # Financial media accounts
+    "bloomberg": 3.5,
+    "reuters": 3.5,
+    "cnbc": 3.0,
+    "wsj": 3.5,
+    "ft": 3.0,
+    "marketwatch": 2.5,
+    "unusual_whales": 3.0,
+    "dikiycpa": 2.5,        # Market commentary
+    "zaborsamiya": 2.5,
+    # Analysts / Market movers
+    "gaborsamiya": 3.0,
+    "hedgeye": 2.5,
+    "traderflorida": 2.0,
+}
+X_BASE_ACCOUNT_WEIGHT = 0.3  # random unknown accounts
+
 
 @dataclass
 class MentionStats:
@@ -112,6 +162,9 @@ class MentionStats:
     attention_score: float = 0.0
     sentiment_adjustment: float = 0.0
     adjusted_prob_buy: float = 0.0
+    # Hard signal flags
+    news_bearish_override: bool = False  # strong negative news → force sell / block buy
+    news_bullish_override: bool = False  # strong positive news → boost conviction
 
 
 def _sentiment_score(text: str) -> float:
@@ -338,8 +391,10 @@ def _x_page_scrape(context, search_urls: list[str]) -> list[dict]:
                     if key in seen:
                         continue
                     seen.add(key)
+                    author = _x_article_author(article)
                     posts.append({
                         "text": text,
+                        "author": author,
                         "public_metrics": _x_article_metrics(article),
                     })
                     if len(posts) >= max_posts:
@@ -656,20 +711,19 @@ def _fetch_x_posts_api(tickers: list[str]) -> tuple[list[dict], bool]:
 
 
 def _fetch_x_posts(tickers: list[str]) -> list[dict]:
-    """Fetch X posts via Playwright scraping (primary) or API (if available).
-    Includes both ticker-specific and broad trending market searches."""
+    """Fetch X posts — prioritizes influencer accounts, then ticker searches."""
     selected = tickers[:X_TOP_N]
     if not selected:
         _mark_source("x", "no tickers")
         return []
 
-    # Build search URLs: ticker-specific + broad trending for discovery
+    # Primary: Influencer posts + ticker-specific searches for top picks
     search_urls = (
-        [_x_search_url(t) for t in selected]
-        + _x_trending_search_urls()
+        _x_influencer_search_urls()
+        + [_x_search_url(t) for t in selected[:8]]
     )
 
-    # Primary path: Playwright scraping via PLAYWRIGHT_CDP_URL
+    # Playwright scraping via PLAYWRIGHT_CDP_URL
     if PLAYWRIGHT_CDP_URL or PLAYWRIGHT_WS_ENDPOINT:
         try:
             _, x_posts = _fetch_all_browser_sources([], search_urls)
@@ -684,7 +738,6 @@ def _fetch_x_posts(tickers: list[str]) -> list[dict]:
         if success and posts:
             return posts
 
-    # Nothing worked
     if not SOURCE_STATUS.get("x", "").startswith("ok"):
         _mark_source("x", "unavailable: Playwright scrape failed, no API token")
     return []
@@ -707,6 +760,61 @@ def _x_trending_search_urls() -> list[str]:
         f"https://x.com/search?q={quote_plus(q)}&src=typed_query&f=top"
         for q in queries
     ]
+
+
+# Key influencers to monitor directly — their posts move markets
+X_INFLUENCER_HANDLES = [
+    # CEOs / Tech leaders
+    "elonmusk",          # Tesla, SpaceX, X
+    "jensenhuang",       # NVIDIA CEO
+    "timcook",           # Apple CEO
+    "satloyal",          # Satya Nadella, Microsoft CEO
+    "sundarpichai",      # Google CEO
+    "lisasu",            # AMD CEO
+    "brian_armstrong",    # Coinbase CEO
+    "markzuckerberg",    # Meta CEO
+    # Politicians (trades & policy moves markets)
+    "realdonaldtrump",   # Trump
+    "potus",             # President
+    "speakerjohnson",    # Speaker of the House
+    "senatorpelosi",     # Known stock trader
+    # Finance / Investors
+    "billackman",        # Bill Ackman (Pershing Square)
+    "carlicahn",         # Carl Icahn
+    "cathiedwood",       # Cathie Wood (ARK Invest)
+    "michaeljburry",     # Michael Burry
+    "chaaborsamiya",     # Chamath
+    "unusual_whales",    # Options flow tracker
+    "jimcramer",         # CNBC (inverse signal for some)
+    # Financial media
+    "bloomberg",
+    "reuters",
+    "cnbc",
+    "wsj",
+    "ft",
+    "marketwatch",
+    "zaborsamiya",
+]
+
+
+def _x_influencer_search_urls() -> list[str]:
+    """Generate X search URLs that target influencer posts about stocks/markets.
+    Searches for posts FROM specific accounts mentioning market-relevant terms."""
+    urls = []
+    # Group handles into batches for OR queries (X search has length limits)
+    batch_size = 5
+    for i in range(0, len(X_INFLUENCER_HANDLES), batch_size):
+        batch = X_INFLUENCER_HANDLES[i:i + batch_size]
+        from_clause = " OR ".join(f"from:{h}" for h in batch)
+        query = f"({from_clause}) (stock OR invest OR buy OR sell OR market OR company OR earnings OR deal)"
+        urls.append(
+            f"https://x.com/search?q={quote_plus(query)}&src=typed_query&f=live"
+        )
+    # Also add direct profile timeline URLs for top 5 most impactful accounts
+    top_accounts = ["elonmusk", "realdonaldtrump", "jensenhuang", "billackman", "unusual_whales"]
+    for handle in top_accounts:
+        urls.append(f"https://x.com/{handle}")
+    return urls
 
 
 def _scrape_x_with_playwright(sync_playwright, timeout_error, search_urls: list[str]) -> list[dict]:
@@ -747,6 +855,7 @@ def _scrape_x_with_playwright(sync_playwright, timeout_error, search_urls: list[
                     seen.add(key)
                     posts.append({
                         "text": text,
+                        "author": _x_article_author(article),
                         "public_metrics": _x_article_metrics(article),
                     })
                     if len(posts) >= 100:
@@ -910,6 +1019,32 @@ def _x_article_text(article) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _x_article_author(article) -> str:
+    """Extract the @handle from a tweet article element."""
+    try:
+        # The user handle is in a link like /@username
+        links = article.locator("a[href^='/']").all()
+        for link in links:
+            href = link.get_attribute("href") or ""
+            if href.startswith("/") and not href.startswith("//"):
+                # Extract handle from /@username or /username/status/...
+                parts = href.strip("/").split("/")
+                if parts and parts[0] and not parts[0].startswith("i/"):
+                    handle = parts[0].lower()
+                    if handle and len(handle) <= 30 and handle.isalnum() or "_" in handle:
+                        return handle
+    except Exception:
+        pass
+    return ""
+
+
+def _x_account_weight(handle: str) -> float:
+    """Return credibility weight for an X account. Known influencers get 3-5x."""
+    if not handle:
+        return X_BASE_ACCOUNT_WEIGHT
+    return X_ACCOUNT_WEIGHTS.get(handle.lower(), X_BASE_ACCOUNT_WEIGHT)
+
+
 def _metric_from_label(label: str) -> int:
     label = label.lower().replace(",", "")
     match = re.search(r"([\d.]+)\s*([km]?)", label)
@@ -1017,12 +1152,12 @@ def build_sentiment_overlay(
         # All Reddit strategies failed — use shared browser for Reddit + X
         reddit_requests = _build_reddit_browser_requests()
         x_search_urls = (
-            [_x_search_url(t) for t in ranked_tickers[:X_TOP_N]]
-            + _x_trending_search_urls()
+            _x_influencer_search_urls()
+            + [_x_search_url(t) for t in ranked_tickers[:8]]
         )
         reddit_posts, x_posts = _fetch_all_browser_sources(reddit_requests, x_search_urls)
     else:
-        # Reddit worked without browser — use X API independently
+        # Reddit worked without browser — use X independently
         x_posts = _fetch_x_posts(ranked_tickers)
 
     for post in (reddit_posts or []):
@@ -1059,12 +1194,16 @@ def build_sentiment_overlay(
         likes = int(metrics.get("like_count", 0) or 0)
         retweets = int(metrics.get("retweet_count", 0) or 0)
         replies = int(metrics.get("reply_count", 0) or 0)
+        author = post.get("author", "")
+        account_weight = _x_account_weight(author)
+
         sentiment = _sentiment_score(text)
+        # Engagement-based attention + account credibility multiplier
         attention = (
-            1
-            + math.log1p(max(likes, 0))
-            + math.log1p(max(retweets, 0))
-            + 0.5 * math.log1p(max(replies, 0))
+            account_weight
+            * (1 + math.log1p(max(likes, 0))
+               + math.log1p(max(retweets, 0))
+               + 0.5 * math.log1p(max(replies, 0)))
         )
         for ticker in mentioned:
             item = stats.get(ticker)
@@ -1163,18 +1302,46 @@ def build_sentiment_overlay(
             + 0.10 * item.attention_score
         )
 
-        # Trending boost: if attention is > 1.5 std above mean AND sentiment
-        # is strongly directional (|sentiment| > 0.3), apply extra boost
-        trending_bonus = 0.0
-        if z_attention > 1.5 and abs(sentiment) > 0.3:
-            # High attention + strong directional sentiment = confidence signal
-            trending_bonus = TRENDING_BOOST * (1 if sentiment > 0 else -1)
-
-        item.sentiment_adjustment = max(
-            -(SENTIMENT_MAX_ADJUST + TRENDING_BOOST),
-            min(SENTIMENT_MAX_ADJUST + TRENDING_BOOST,
-                sentiment * SENTIMENT_MAX_ADJUST + trending_bonus),
+        # ── Override detection ────────────────────────────────────────────
+        # If sentiment is overwhelmingly negative across multiple sources,
+        # the news should OVERRIDE the technical model (force sell / block buy).
+        # Conditions: high attention + strongly negative from 2+ sources.
+        sources_negative = (
+            (1 if item.weighted_news_sentiment < -0.25 else 0)
+            + (1 if item.reddit_sentiment < -0.25 else 0)
+            + (1 if item.x_sentiment < -0.25 else 0)
         )
+        sources_positive = (
+            (1 if item.weighted_news_sentiment > 0.25 else 0)
+            + (1 if item.reddit_sentiment > 0.25 else 0)
+            + (1 if item.x_sentiment > 0.25 else 0)
+        )
+        total_mentions = item.reddit_mentions + item.x_mentions + item.news_mentions
+
+        if sources_negative >= 2 and total_mentions >= 3 and sentiment < -0.3:
+            # Overwhelming negative coverage → force prob_buy to near zero
+            item.news_bearish_override = True
+            item.sentiment_adjustment = -0.40  # crush the score
+        elif sources_positive >= 2 and total_mentions >= 3 and sentiment > 0.3:
+            # Overwhelming positive coverage → strong conviction boost
+            item.news_bullish_override = True
+            trending_bonus = TRENDING_BOOST * 2  # double trending boost
+            item.sentiment_adjustment = min(
+                SENTIMENT_MAX_ADJUST + TRENDING_BOOST * 2,
+                sentiment * SENTIMENT_MAX_ADJUST + trending_bonus,
+            )
+        else:
+            # Normal overlay logic
+            trending_bonus = 0.0
+            if z_attention > 1.5 and abs(sentiment) > 0.3:
+                trending_bonus = TRENDING_BOOST * (1 if sentiment > 0 else -1)
+
+            item.sentiment_adjustment = max(
+                -(SENTIMENT_MAX_ADJUST + TRENDING_BOOST),
+                min(SENTIMENT_MAX_ADJUST + TRENDING_BOOST,
+                    sentiment * SENTIMENT_MAX_ADJUST + trending_bonus),
+            )
+
         item.adjusted_prob_buy = float(base_probs.get(ticker, 0.0)) + item.sentiment_adjustment
 
     out = pd.DataFrame([asdict(item) for item in stats.values()])

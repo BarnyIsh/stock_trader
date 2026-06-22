@@ -727,11 +727,8 @@ def _fetch_x_posts(tickers: list[str]) -> list[dict]:
         _mark_source("x", "no tickers")
         return []
 
-    # Primary: Influencer posts + ticker-specific searches for top picks
-    search_urls = (
-        _x_influencer_search_urls()
-        + [_x_search_url(t) for t in selected[:8]]
-    )
+    # Primary: Influencer search only (fits in Browserless 30s free tier)
+    search_urls = _x_influencer_search_urls()
 
     # Playwright scraping via PLAYWRIGHT_CDP_URL
     if PLAYWRIGHT_CDP_URL or PLAYWRIGHT_WS_ENDPOINT:
@@ -837,24 +834,36 @@ X_INFLUENCER_HANDLES = [
 
 def _x_influencer_search_urls() -> list[str]:
     """Generate X search URLs that target influencer posts about stocks/markets.
-    Searches for posts FROM specific accounts mentioning market-relevant terms."""
+    Kept small (3-4 URLs) to fit within Browserless free tier 30s timeout."""
     urls = []
-    # Group handles into batches for OR queries (X search has length limits)
-    batch_size = 5
-    for i in range(0, len(X_INFLUENCER_HANDLES), batch_size):
-        batch = X_INFLUENCER_HANDLES[i:i + batch_size]
-        from_clause = " OR ".join(f"from:{h}" for h in batch)
-        query = f"({from_clause}) (stock OR invest OR buy OR sell OR market OR company OR earnings OR deal)"
-        urls.append(
-            f"https://x.com/search?q={quote_plus(query)}&src=typed_query&f=live"
-        )
-    # Also add direct profile timeline URLs for most impactful accounts
-    top_accounts = [
+    # Single search with the highest-impact accounts combined
+    top_handles = [
         "elonmusk", "realdonaldtrump", "jensenhuang", "sama",
-        "billackman", "unusual_whales", "nvidia", "openai", "federalreserve",
+        "billackman", "unusual_whales", "nancypelosi", "michaeljburry",
+        "cathiedwood", "federalreserve",
     ]
-    for handle in top_accounts:
-        urls.append(f"https://x.com/{handle}")
+    from_clause = " OR ".join(f"from:{h}" for h in top_handles)
+    query = f"({from_clause}) (stock OR invest OR buy OR sell OR market OR company OR earnings OR deal OR AI)"
+    urls.append(
+        f"https://x.com/search?q={quote_plus(query)}&src=typed_query&f=live"
+    )
+
+    # Company accounts in one search
+    company_handles = [
+        "openai", "anthropicai", "nvidia", "apple", "microsoft",
+        "google", "meta", "amazon", "tesla", "spacex",
+    ]
+    company_clause = " OR ".join(f"from:{h}" for h in company_handles)
+    query2 = f"({company_clause}) (launch OR announce OR partner OR invest OR release OR deal)"
+    urls.append(
+        f"https://x.com/search?q={quote_plus(query2)}&src=typed_query&f=live"
+    )
+
+    # One broad trending stocks query
+    urls.append(
+        f"https://x.com/search?q={quote_plus('$SPY OR $QQQ OR $NVDA OR $TSLA OR $AAPL min_faves:100 lang:en')}&src=typed_query&f=top"
+    )
+
     return urls
 
 
@@ -1192,10 +1201,7 @@ def build_sentiment_overlay(
     if needs_browser:
         # All Reddit strategies failed — use shared browser for Reddit + X
         reddit_requests = _build_reddit_browser_requests()
-        x_search_urls = (
-            _x_influencer_search_urls()
-            + [_x_search_url(t) for t in ranked_tickers[:8]]
-        )
+        x_search_urls = _x_influencer_search_urls()
         reddit_posts, x_posts = _fetch_all_browser_sources(reddit_requests, x_search_urls)
     else:
         # Reddit worked without browser — use X independently

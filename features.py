@@ -24,6 +24,7 @@ from config       import (
     RSI_PERIOD, MACD_FAST, MACD_SLOW, MACD_SIGNAL, BB_PERIOD, BB_STD,
     BENCHMARK_TICKER,
 )
+from executive_moves import build_exec_move_features
 
 if os.getenv("VERCEL"):
     cache_dir = "/tmp/py-yfinance"
@@ -209,6 +210,20 @@ def build_feature_matrix(
         return pd.DataFrame()
 
     out = pd.concat(frames)
+
+    # ── Executive movement features (live signal, joined by ticker) ───────────
+    try:
+        exec_df = build_exec_move_features(tickers)
+        if not exec_df.empty:
+            out = out.merge(exec_df, on="ticker", how="left")
+            exec_cols = [c for c in exec_df.columns if c != "ticker"]
+            out[exec_cols] = out[exec_cols].fillna(0)
+    except Exception as exc:
+        print(f"[features] Executive move features unavailable: {exc}")
+        for col in EXEC_FEATURE_COLS:
+            if col not in out.columns:
+                out[col] = 0.0
+
     # Drop rows with NaN in feature columns (warm-up period)
     feature_cols = [c for c in out.columns
                     if c not in ("ticker","future_return","label","volume")]
@@ -220,6 +235,14 @@ def build_feature_matrix(
 
 
 # ─── Feature column selector ─────────────────────────────────────────────────
+
+EXEC_FEATURE_COLS = [
+    "exec_departures_30d",
+    "exec_arrivals_30d",
+    "exec_net_flow_30d",
+    "exec_departure_severity",
+    "exec_move_sentiment",
+]
 
 FEATURE_COLS = [
     "rsi","rsi_slow","stoch_k","stoch_d",
@@ -236,4 +259,7 @@ FEATURE_COLS = [
     "body","upper_wick","lower_wick","is_bullish",
     "benchmark_ret_5","benchmark_ret_20","benchmark_volatility_20d",
     "relative_roc_5","relative_roc_20",
+    # Executive / key personnel movement signals
+    "exec_departures_30d","exec_arrivals_30d","exec_net_flow_30d",
+    "exec_departure_severity","exec_move_sentiment",
 ]

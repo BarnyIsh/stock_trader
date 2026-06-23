@@ -70,6 +70,11 @@ MAX_DEBT_EQUITY = 2.0
 # Model re-train cadence
 RETRAIN_EVERY_N_DAYS = 30
 
+# ─── Executive / personnel movement tracking ─────────────────────────────────
+EXEC_MOVE_LOOKBACK_DAYS = int(os.getenv("EXEC_MOVE_LOOKBACK_DAYS", "30"))
+EXEC_NEWS_TIMEOUT       = float(os.getenv("EXEC_NEWS_TIMEOUT", "8"))
+FINNHUB_API_KEY         = os.getenv("FINNHUB_API_KEY", "")
+
 # Score threshold above which we consider a stock a buy
 BUY_SCORE_THRESHOLD  = 0.38
 SELL_SCORE_THRESHOLD = 0.30
